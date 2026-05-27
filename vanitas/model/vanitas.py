@@ -40,7 +40,7 @@ class VanitasModel(nn.Module):
             hop_length=self.config.hop_length
         )
 
-    def forward(self, mel_frames: torch.Tensor, memory_embeddings: torch.Tensor = None, time_steps: torch.Tensor = None) -> tuple:
+    def forward(self, mel_frames: torch.Tensor, memory_embeddings: torch.Tensor = None, time_steps: torch.Tensor = None) -> dict:
         """
         Processes continuous mel frames streamingly through the three-stream architecture.
         
@@ -50,10 +50,15 @@ class VanitasModel(nn.Module):
             time_steps: Optional tensor of shape (B, 1) for Flow Matching training
             
         Returns:
-            tuple containing:
-                - audio_waveforms: (B, 1, T * hop_length) Output audio via vocoder (inference only)
-                - v_pred: (B, T, mel_dim) Flow matching velocity (training only)
-                - gates: Tuple of (think_gate, backchannel_gate, speak_gate)
+            dict containing:
+                - "audio": (B, 1, T * hop_length) Output audio via vocoder (inference only)
+                - "v_pred": (B, T, mel_dim) Flow matching velocity (training only)
+                - "perception_outputs": (B, T, perception_dim) Perception stream hidden outputs
+                - "perception_state": (B, perception_dim) Final state snapshot of Perception
+                - "cognition_state": (B, T, cognition_dim) Reasoning state from Cognition Core
+                - "think_gate": (B, T, 1) Gating activation for turn-taking
+                - "backchannel_gate": (B, T, 1) Gating activation for backchannels
+                - "speak_gate": (B, T, 1) Gating activation for speaking
         """
         # 1. Run through Mamba-2 Perception Stream
         perception_outputs, perception_state = self.perception(mel_frames)
@@ -72,9 +77,20 @@ class VanitasModel(nn.Module):
         if self.training and time_steps is not None:
             # Training mode: Predict vector fields
             v_pred = self.flow_head(production_state, time_steps)
-            return None, v_pred, (think_gate, backchannel_gate, speak_gate)
+            audio_waveforms = None
         else:
             # Inference mode: Euler integration and Vocoder
+            v_pred = None
             mel_pred = self.flow_head.generate(production_state, steps=10)
             audio_waveforms = self.vocoder(mel_pred)
-            return audio_waveforms, None, (think_gate, backchannel_gate, speak_gate)
+            
+        return {
+            "audio": audio_waveforms,
+            "v_pred": v_pred,
+            "perception_outputs": perception_outputs,
+            "perception_state": perception_state,
+            "cognition_state": cognition_state,
+            "think_gate": think_gate,
+            "backchannel_gate": backchannel_gate,
+            "speak_gate": speak_gate
+        }

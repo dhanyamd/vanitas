@@ -28,22 +28,25 @@ def test_vanitas_model_forward():
     # 1. Test inference (no time_steps)
     model.eval()
     with torch.no_grad():
-        audio, v_pred, gates = model(mel_frames, memory_embeddings)
+        outputs = model(mel_frames, memory_embeddings)
+        audio = outputs["audio"]
+        v_pred = outputs["v_pred"]
+        think = outputs["think_gate"]
         
         assert audio is not None, "Inference should return audio waveforms"
         assert v_pred is None, "Inference shouldn't return velocity predictions"
         
         # Audio length = seq_len * hop_length
         assert audio.shape == (batch_size, 1, seq_len * config.hop_length)
-        
-        think, backchannel, speak = gates
         assert think.shape == (batch_size, seq_len, 1)
         
     # 2. Test training (with time_steps)
     model.train()
     time_steps = torch.rand(batch_size, 1)
     
-    audio, v_pred, gates = model(mel_frames, memory_embeddings, time_steps)
+    outputs = model(mel_frames, memory_embeddings, time_steps)
+    audio = outputs["audio"]
+    v_pred = outputs["v_pred"]
     
     assert audio is None, "Training shouldn't return audio waveforms"
     assert v_pred is not None, "Training should return velocity predictions"

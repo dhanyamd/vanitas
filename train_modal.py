@@ -30,10 +30,15 @@ if MODAL_AVAILABLE:
             "huggingface_hub>=0.20.0",
             "wandb>=0.18.0",
             "click>=8.1.0",
-            "soundfile>=0.12.1"
+            "soundfile>=0.12.1",
+            "chromadb>=0.4.0"
         )
         # Install optimized Mamba CUDA kernels - these compile cleanly inside CUDA environment
         .pip_install("causal-conv1d>=1.4.0", "mamba-ssm>=2.2.0", pre=True)
+        .add_local_dir(
+            str(Path(__file__).resolve().parent / "vanitas"),
+            remote_path="/root/vanitas"
+        )
     )
     
     app = modal.App(name="vanitas-training")
@@ -56,22 +61,26 @@ def run_local_training(epochs: int, batch_size: int):
     
     config = GlobalConfig()
     
-    print("\n[Step 1] Loading local mock training and validation datasets...")
-    # Force use of mock synthetic data to guarantee it runs offline instantly
-    train_ds = SpokenDialogueDataset(config=config, split="train", max_samples=4, use_mock=True)
-    val_ds = SpokenDialogueDataset(config=config, split="val", max_samples=2, use_mock=True)
-    
-    print(f"Loaded {len(train_ds)} train and {len(val_ds)} validation mock dialogues.")
-    
-    print("\n[Step 2] Initializing Vanitas Architecture Model...")
+    print("\n[Step 1] Initializing Vanitas Model Configuration...")
     from vanitas.model.config import VanitasModelConfig
     model_config = VanitasModelConfig(
         perception_layers=2, # Scale layers down to 2 for instant compilation and execution
+        cognition_layers=2,
+        production_layers=2,
         perception_dim=128,   # Scale dim to 128
+        cognition_dim=128,
+        production_dim=128,
+        memory_dim=128,
         gate_hidden_dim=64
     )
     model = VanitasModel(model_config)
     print("Vanitas model structure successfully initialized.")
+    
+    print("\n[Step 2] Loading local mock training and validation datasets...")
+    # Force use of mock synthetic data to guarantee it runs offline instantly
+    train_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="train", max_samples=4, use_mock=True)
+    val_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="val", max_samples=2, use_mock=True)
+    print(f"Loaded {len(train_ds)} train and {len(val_ds)} validation mock dialogues.")
     
     print(f"\n[Step 3] Initializing SpokenDialogueTrainer for {epochs} epochs...")
     trainer = SpokenDialogueTrainer(
@@ -99,13 +108,7 @@ if MODAL_AVAILABLE:
         image=vanitas_image,
         gpu="A100", # Secure NVIDIA A100 GPU (40GB or 80GB)
         timeout=7200, # 2 hours max run time
-        volumes={"/root/checkpoints": checkpoints_volume},
-        mounts=[
-            modal.Mount.from_local_dir(
-                str(Path(__file__).resolve().parent / "vanitas"), 
-                remote_path="/root/vanitas"
-            )
-        ]
+        volumes={"/root/checkpoints": checkpoints_volume}
     )
     def train_cloud(epochs: int = 50, batch_size: int = 16, lr: float = 2e-4, use_wandb: bool = False):
         """Runs the full academic training loop in the cloud on a dedicated A100 GPU."""
@@ -130,12 +133,7 @@ if MODAL_AVAILABLE:
         if torch.cuda.is_available():
             print(f"GPU Device: {torch.cuda.get_device_name(0)}")
             
-        print("\n[Step 2] Downloading 'kyutai/DailyTalkContiguous' dataset from Hugging Face...")
-        train_ds = SpokenDialogueDataset(config=config, split="train", use_mock=False)
-        val_ds = SpokenDialogueDataset(config=config, split="val", use_mock=False)
-        print(f"Downloaded {len(train_ds)} train dialogues and {len(val_ds)} validation dialogues.")
-        
-        print("\n[Step 3] Initializing full academic Vanitas Model (~85M params)...")
+        print("\n[Step 2] Initializing full academic Vanitas Model (~85M params)...")
         # Full hyperparameter targets for paper benchmarks
         model_config = VanitasModelConfig(
             perception_dim=512,
@@ -144,6 +142,11 @@ if MODAL_AVAILABLE:
             gate_hidden_dim=256
         )
         model = VanitasModel(model_config)
+        
+        print("\n[Step 3] Downloading 'kyutai/DailyTalkContiguous' dataset from Hugging Face...")
+        train_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="train", use_mock=False)
+        val_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="val", use_mock=False)
+        print(f"Downloaded {len(train_ds)} train dialogues and {len(val_ds)} validation dialogues.")
         
         # Log parameter count
         total_params = sum(p.numel() for p in model.parameters())

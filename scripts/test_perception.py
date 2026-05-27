@@ -39,7 +39,12 @@ def test_perception_flow():
     
     print("\n[Step 4] Executing forward pass...")
     # Forward pass
-    perception_outputs, perception_state, think_gate, backchannel_gate, speak_gate = model(mel_input)
+    outputs = model(mel_input)
+    perception_outputs = outputs["perception_outputs"]
+    perception_state = outputs["perception_state"]
+    think_gate = outputs["think_gate"]
+    backchannel_gate = outputs["backchannel_gate"]
+    speak_gate = outputs["speak_gate"]
     
     print("\n🟢 Model Forward Completed. Output Dimension Verification:")
     print(f"Perception Stream Sequence Outputs: {list(perception_outputs.shape)} (Expected: [2, 50, 256])")

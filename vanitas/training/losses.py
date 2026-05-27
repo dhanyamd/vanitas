@@ -95,3 +95,132 @@ class JointPerceptionGateLoss(nn.Module):
         total_loss = lambda_mel * mel_loss + lambda_gate * gate_loss
         
         return total_loss, mel_loss, gate_loss
+
+
+class FullVanitasLoss(nn.Module):
+    """Calculates the complete joint loss for all three streams:
+    1. Perception Self-Supervised Masked Mel Reconstruction (MSE)
+    2. Fusion Gates Gating (BCE on turn-taking triggers)
+    3. Cognition Core Context Alignment (Symmetric CLIP-style Contrastive InfoNCE)
+    4. Production Stream continuous Mel generation (Flow Matching MSE)
+    """
+    
+    def __init__(self, 
+                 mel_bins: int = 80, 
+                 model_dim: int = 512, 
+                 gate_pos_weight: float = 10.0, 
+                 contrastive_temp: float = 0.07):
+        super().__init__()
+        self.mel_bins = mel_bins
+        self.model_dim = model_dim
+        self.gate_pos_weight = gate_pos_weight
+        self.contrastive_temp = contrastive_temp
+        
+        # Self-supervised mel reconstruction head (maps 512 model dim -> 80 mel bins)
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(self.model_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, self.mel_bins)
+        )
+        
+    def forward(self, 
+                model_outputs: dict, 
+                ground_truth_mel: torch.Tensor,     # (B, T, mel_bins) (User mel input)
+                mask_indices: torch.Tensor,         # (B, T)
+                turn_targets: torch.Tensor,         # (B, T, 1)
+                agent_mel: torch.Tensor,            # (B, T, mel_bins) (Agent target mel)
+                semantic_target: torch.Tensor,      # (B, D_memory) (Target semantic embedding)
+                lengths: torch.Tensor) -> dict:     # (B,) (actual sequence lengths)
+        """
+        Computes the unified joint loss.
+        """
+        device = ground_truth_mel.device
+        B_sz, T_sz, _ = ground_truth_mel.shape
+        
+        # Create sequence length mask to ignore padded tails
+        seq_mask = torch.zeros(B_sz, T_sz, device=device)
+        for i, length in enumerate(lengths):
+            seq_mask[i, :length] = 1.0
+            
+        # 1. Masked Mel Spectrogram Reconstruction Loss (MSE) - Perception Stream
+        perception_outputs = model_outputs["perception_outputs"]
+        pred_mel = self.reconstruction_head(perception_outputs)
+        squared_err = (pred_mel - ground_truth_mel).pow(2)
+        mel_active_mask = mask_indices.unsqueeze(-1) * seq_mask.unsqueeze(-1)
+        masked_sum = (squared_err * mel_active_mask).sum()
+        total_masked_elements = mel_active_mask.sum() * self.mel_bins
+        mel_loss = masked_sum / max(1.0, total_masked_elements.item())
+        
+        # 2. Gating Turn-Taking Classification Loss (Weighted BCE) - Fusion Gates
+        think_gate_preds = model_outputs["think_gate"]
+        think_preds_clipped = torch.clamp(think_gate_preds, min=1e-6, max=1.0 - 1e-6)
+        pos_weight = self.gate_pos_weight
+        bce_loss_raw = - (
+            pos_weight * turn_targets * torch.log(think_preds_clipped) + 
+            (1.0 - turn_targets) * torch.log(1.0 - think_preds_clipped)
+        )
+        gate_active_mask = seq_mask.unsqueeze(-1)
+        gate_loss_sum = (bce_loss_raw * gate_active_mask).sum()
+        total_gate_elements = gate_active_mask.sum()
+        gate_loss = gate_loss_sum / max(1.0, total_gate_elements.item())
+        
+        # 3. Cognition Context Alignment Loss (Symmetric CLIP InfoNCE) - Cognition Core
+        # Pool cognition states at turn boundary frames (where turn_targets == 1)
+        cognition_state = model_outputs["cognition_state"] # (B, T, D_cognition)
+        boundary_weights = turn_targets * seq_mask.unsqueeze(-1) # (B, T, 1)
+        sum_rep = (cognition_state * boundary_weights).sum(dim=1) # (B, D_cognition)
+        sum_weight = boundary_weights.sum(dim=1) # (B, 1)
+        
+        active_rep = sum_rep / torch.clamp(sum_weight, min=1e-6) # (B, D_cognition)
+        mean_rep = (cognition_state * seq_mask.unsqueeze(-1)).sum(dim=1) / torch.clamp(seq_mask.sum(dim=1, keepdim=True), min=1e-6)
+        
+        # If a sequence has no boundary triggers, fall back to average representation
+        has_boundary = (sum_weight > 0).float() # (B, 1)
+        pooled_rep = has_boundary * active_rep + (1.0 - has_boundary) * mean_rep # (B, D_cognition)
+        
+        # Normalize representations to compute cosine similarities
+        pooled_rep_norm = F.normalize(pooled_rep, p=2, dim=-1)
+        semantic_target_norm = F.normalize(semantic_target, p=2, dim=-1)
+        
+        # Cosine similarity matrix: (B, B)
+        similarity_matrix = torch.matmul(pooled_rep_norm, semantic_target_norm.t()) / self.contrastive_temp
+        labels = torch.arange(B_sz, device=device)
+        
+        loss_queries = F.cross_entropy(similarity_matrix, labels)
+        loss_targets = F.cross_entropy(similarity_matrix.t(), labels)
+        cognition_loss = (loss_queries + loss_targets) / 2.0
+        
+        # 4. Production Continuous Flow Matching Loss (MSE on predicted vs target velocity) - Production Stream
+        v_pred = model_outputs["v_pred"] # (B, T, mel_bins)
+        # Sample random noise y0: (B, T, mel_bins)
+        y0 = torch.randn_like(agent_mel)
+        v_target = agent_mel - y0 # Velocity field points directly from noise y0 to target agent_mel
+        
+        # Compute squared errors on velocity prediction, masking padding
+        flow_squared_err = (v_pred - v_target).pow(2)
+        flow_active_mask = seq_mask.unsqueeze(-1)
+        flow_loss_sum = (flow_squared_err * flow_active_mask).sum()
+        total_flow_elements = flow_active_mask.sum() * self.mel_bins
+        flow_loss = flow_loss_sum / max(1.0, total_flow_elements.item())
+        
+        # 5. Joint Loss Weighted Combination
+        lambda_mel = 1.0
+        lambda_gate = 2.0
+        lambda_cognition = 1.0
+        lambda_flow = 1.0
+        
+        total_loss = (
+            lambda_mel * mel_loss + 
+            lambda_gate * gate_loss + 
+            lambda_cognition * cognition_loss + 
+            lambda_flow * flow_loss
+        )
+        
+        return {
+            "total_loss": total_loss,
+            "mel_loss": mel_loss,
+            "gate_loss": gate_loss,
+            "cognition_loss": cognition_loss,
+            "flow_loss": flow_loss
+        }
+
