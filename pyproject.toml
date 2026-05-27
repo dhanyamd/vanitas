@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vanitas"
+version = "0.1.0"
+description = "A Three-Stream Parallel Neural Architecture with Learned Fusion Gates for Low-Latency Continuous-Audio Voice Agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "sounddevice>=0.5.0",
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+    "librosa>=0.10.0",
+    "torch>=2.2.0",
+    "torchaudio>=2.2.0",
+    "faster-whisper>=1.1.0",
+    "kokoro>=0.1.0",
+    "silero-vad>=5.1.0",
+    "chromadb>=0.5.0",
+    "wandb>=0.18.0",
+    "datasets>=3.0.0",
+    "huggingface_hub>=0.20.0",
+    "einops>=0.8.0",
+    "modal>=0.62.0",
+    "click>=8.1.0"
+]
+
+[project.scripts]
+vanitas = "vanitas.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vanitas*"]
