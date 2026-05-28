@@ -1,9 +1,46 @@
+import time
+import threading
+import asyncio
 import logging
 from vanitas.config import GlobalConfig
 from vanitas.baseline.pipeline import CascadedBaselinePipeline
+from vanitas.inference.server import VanitasInferenceServer
+from vanitas.inference.client import VanitasTerminalClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vanitas.pipeline.orchestrator")
+
+class VanitasPipelineWrapper:
+    """Wraps the Vanitas server and client to run together in interactive mode."""
+    def __init__(self, config: GlobalConfig):
+        self.config = config
+        self.server_thread = None
+        self.server = None
+        self.client = None
+        self.latency_stats = []  # Maintain interface compatibility with main.py stats
+        
+    def start(self):
+        checkpoint_path = self.config.checkpoints_dir / "best_model.pt"
+        self.server = VanitasInferenceServer(host="localhost", port=8000, checkpoint_path=str(checkpoint_path))
+        
+        def run_server_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.server.run())
+            
+        self.server_thread = threading.Thread(target=run_server_loop, daemon=True)
+        self.server_thread.start()
+        
+        # Allow the server socket to open and bind
+        time.sleep(1.5)
+        
+        # Run client in foreground
+        self.client = VanitasTerminalClient(uri="ws://localhost:8000")
+        self.client.start()
+        
+    def stop(self):
+        if self.client:
+            self.client.stop()
 
 class Orchestrator:
     """The central coordinator that switches modes between baseline (cascaded) and Vanitas (learned)."""
@@ -19,8 +56,7 @@ class Orchestrator:
             self.pipeline = CascadedBaselinePipeline(self.config)
         elif self.mode == "vanitas":
             logger.info("Initializing Vanitas Three-Stream Parallel Pipeline...")
-            # We will wire the Vanitas parallel pipeline in Phase 2
-            self.pipeline = None
+            self.pipeline = VanitasPipelineWrapper(self.config)
         else:
             raise ValueError(f"Unknown mode: {mode}. Must be 'baseline' or 'vanitas'.")
 

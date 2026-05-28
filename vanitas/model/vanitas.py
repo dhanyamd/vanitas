@@ -63,11 +63,11 @@ class VanitasModel(nn.Module):
         # 1. Run through Mamba-2 Perception Stream
         perception_outputs, perception_state = self.perception(mel_frames)
         
-        # 2. Run outputs frame-by-frame through Fusion Gates
-        think_gate, backchannel_gate, speak_gate = self.gates(perception_outputs)
-        
-        # 3. Trigger Cognition Core (Reasoning)
+        # 2. Trigger Cognition Core (Reasoning)
         cognition_state = self.cognition(perception_outputs, memory_embeddings)
+        
+        # 3. Run outputs frame-by-frame through Fusion Gates
+        think_gate, backchannel_gate, speak_gate = self.gates(perception_outputs, cognition_state)
         
         # 4. Run through Production Stream (Generation)
         # Align dimensions if necessary (here they are both 512)
