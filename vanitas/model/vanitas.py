@@ -40,12 +40,13 @@ class VanitasModel(nn.Module):
             hop_length=self.config.hop_length
         )
 
-    def forward(self, mel_frames: torch.Tensor, memory_embeddings: torch.Tensor = None, time_steps: torch.Tensor = None) -> dict:
+    def forward(self, mel_frames: torch.Tensor, agent_mel_frames: torch.Tensor = None, memory_embeddings: torch.Tensor = None, time_steps: torch.Tensor = None) -> dict:
         """
         Processes continuous mel frames streamingly through the three-stream architecture.
         
         Args:
             mel_frames: Tensor of shape (B, T, mel_bins)
+            agent_mel_frames: Optional tensor of shape (B, T, mel_bins) for Duplex feedback
             memory_embeddings: Optional tensor of shape (B, K, memory_dim) for Cognition
             time_steps: Optional tensor of shape (B, 1) for Flow Matching training
             
@@ -61,7 +62,7 @@ class VanitasModel(nn.Module):
                 - "speak_gate": (B, T, 1) Gating activation for speaking
         """
         # 1. Run through Mamba-2 Perception Stream
-        perception_outputs, perception_state = self.perception(mel_frames)
+        perception_outputs, perception_state = self.perception(mel_frames, agent_mel_frames)
         
         # 2. Trigger Cognition Core (Reasoning)
         cognition_state = self.cognition(perception_outputs, memory_embeddings)

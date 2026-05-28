@@ -132,8 +132,17 @@ class VanitasInferenceServer:
             win_length=400,
             n_mels=self.model_config.mel_bins
         )
+        agent_mel_extractor = MelExtractor(
+            sample_rate=self.model_config.sample_rate,
+            n_fft=400,
+            hop_length=self.model_config.hop_length,
+            win_length=400,
+            n_mels=self.model_config.mel_bins
+        )
         
         user_mel_history = None
+        agent_mel_history = None
+        pending_agent_mel_frames = []
         session_memory_embeddings = torch.zeros(1, 0, self.model_config.memory_dim, device=self.device)
         
         # Dialogue loop variables
@@ -142,7 +151,7 @@ class VanitasInferenceServer:
         response_task = None
         
         async def generate_and_stream_response(model_outputs):
-            nonlocal agent_speaking
+            nonlocal agent_speaking, pending_agent_mel_frames
             try:
                 audio_tensor = model_outputs["audio"]
                 if audio_tensor is None:
@@ -151,6 +160,14 @@ class VanitasInferenceServer:
                 
                 audio_np = audio_tensor.detach().cpu().numpy().flatten()
                 logger.info(f"Response synthesis complete. Generated {len(audio_np)} samples (~{len(audio_np)/16000:.2f}s). Streaming to client...")
+                
+                # Convert generated audio into agent mel frames
+                agent_mel_extractor.reset()
+                agent_response_mel = agent_mel_extractor.feed_audio(audio_np).to(self.device) # (1, T_gen, n_mels)
+                if agent_response_mel.size(1) > 0:
+                    pending_agent_mel_frames = [agent_response_mel[:, t:t+1, :] for t in range(agent_response_mel.size(1))]
+                else:
+                    pending_agent_mel_frames = []
                 
                 # Signal speaking start
                 await websocket.send(json.dumps({"type": "speaking_start"}))
@@ -187,7 +204,9 @@ class VanitasInferenceServer:
                             if response_task and not response_task.done():
                                 response_task.cancel()
                             agent_speaking = False
+                            pending_agent_mel_frames.clear()
                             user_mel_history = None
+                            agent_mel_history = None
                             session_memory_embeddings = torch.zeros(1, 0, self.model_config.memory_dim, device=self.device)
                             await websocket.send(json.dumps({"type": "interrupted"}))
                             
@@ -210,30 +229,47 @@ class VanitasInferenceServer:
                         if response_task and not response_task.done():
                             response_task.cancel()
                         agent_speaking = False
+                        pending_agent_mel_frames.clear()
                         user_mel_history = None
+                        agent_mel_history = None
                         session_memory_embeddings = torch.zeros(1, 0, self.model_config.memory_dim, device=self.device)
                         await websocket.send(json.dumps({"type": "interrupted"}))
                         continue
                         
                     # Feed audio to the log-mel extractor
-                    new_mel = mel_extractor.feed_audio(pcm_data)
-                    if new_mel.size(1) == 0:
+                    new_user_mel = mel_extractor.feed_audio(pcm_data)
+                    if new_user_mel.size(1) == 0:
                         continue
                         
+                    T_new = new_user_mel.size(1)
+                    
+                    # Construct matching agent mel frames (either popped from pending or silence)
+                    agent_frames_list = []
+                    for _ in range(T_new):
+                        if len(pending_agent_mel_frames) > 0:
+                            agent_frames_list.append(pending_agent_mel_frames.pop(0))
+                        else:
+                            agent_frames_list.append(torch.full((1, 1, self.model_config.mel_bins), -5.0, device=self.device))
+                    new_agent_mel = torch.cat(agent_frames_list, dim=1) # (1, T_new, mel_bins)
+                    
                     # Append new mel frames to history
                     if user_mel_history is None:
-                        user_mel_history = new_mel.to(self.device)
+                        user_mel_history = new_user_mel.to(self.device)
+                        agent_mel_history = new_agent_mel.to(self.device)
                     else:
-                        user_mel_history = torch.cat([user_mel_history, new_mel.to(self.device)], dim=1)
+                        user_mel_history = torch.cat([user_mel_history, new_user_mel.to(self.device)], dim=1)
+                        agent_mel_history = torch.cat([agent_mel_history, new_agent_mel.to(self.device)], dim=1)
                         
                     # Limit context history to last 10 seconds (1000 frames) to keep operations fast
                     if user_mel_history.size(1) > 1000:
                         user_mel_history = user_mel_history[:, -1000:, :]
+                        agent_mel_history = agent_mel_history[:, -1000:, :]
                         
                     # Run forward pass of model to calculate gating activations
                     with torch.no_grad():
                         outputs = self.model(
                             user_mel_history, 
+                            agent_mel_frames=agent_mel_history,
                             memory_embeddings=session_memory_embeddings
                         )
                         
@@ -242,6 +278,20 @@ class VanitasInferenceServer:
                     speak_val = outputs["speak_gate"][0, -1, 0].item()
                     
                     logger.debug(f"Gates: think={think_val:.3f}, speak={speak_val:.3f}")
+                    
+                    # Neural interruption: if agent is active but the neural speak gate drops, stop.
+                    if agent_speaking and speak_val < self.speak_threshold:
+                        logger.info(f"🗣️ Neural yield detected (speak_gate={speak_val:.3f} < {self.speak_threshold})! Interrupting agent...")
+                        session["interrupted"] = True
+                        if response_task and not response_task.done():
+                            response_task.cancel()
+                        agent_speaking = False
+                        pending_agent_mel_frames.clear()
+                        user_mel_history = None
+                        agent_mel_history = None
+                        session_memory_embeddings = torch.zeros(1, 0, self.model_config.memory_dim, device=self.device)
+                        await websocket.send(json.dumps({"type": "interrupted"}))
+                        continue
                     
                     # State triggers:
                     # 1. Think Gate fires: query RAG database

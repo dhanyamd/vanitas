@@ -138,9 +138,14 @@ class SpokenDialogueTrainer:
             
             self.optimizer.zero_grad()
             
+            # Construct shifted agent feedback to prevent causal leakage during training
+            agent_mel_shifted = torch.full_like(agent_mel, -5.0)
+            if agent_mel.size(1) > 1:
+                agent_mel_shifted[:, 1:, :] = agent_mel[:, :-1, :]
+            
             # 1. Fetch factual RAG memory embeddings using current Perception stream state
             with torch.no_grad(): # Keep retrieval retrieval pipeline gradient-free
-                _, perception_state = self.model.perception(masked_mel)
+                _, perception_state = self.model.perception(masked_mel, agent_mel_shifted)
                 memory_embeddings, _ = self.retriever(perception_state, top_k=2)
                 
             # 2. Sample random timesteps t in [0, 1] for Flow Matching velocity predictions
@@ -150,6 +155,7 @@ class SpokenDialogueTrainer:
             # 3. Model Forward: Outputs dict containing all stream logits/states
             outputs = self.model(
                 masked_mel, 
+                agent_mel_frames=agent_mel_shifted,
                 memory_embeddings=memory_embeddings, 
                 time_steps=time_steps
             )
@@ -230,8 +236,13 @@ class SpokenDialogueTrainer:
                 semantic_target = batch["semantic_target"].to(self.device)
                 lengths = batch["lengths"].to(self.device)
                 
+                # Shift agent feedback to prevent causal leakage
+                agent_mel_shifted = torch.full_like(agent_mel, -5.0)
+                if agent_mel.size(1) > 1:
+                    agent_mel_shifted[:, 1:, :] = agent_mel[:, :-1, :]
+                
                 # Retrieval
-                _, perception_state = self.model.perception(masked_mel)
+                _, perception_state = self.model.perception(masked_mel, agent_mel_shifted)
                 memory_embeddings, _ = self.retriever(perception_state, top_k=2)
                 
                 # Flow matching steps
@@ -243,6 +254,7 @@ class SpokenDialogueTrainer:
                 self.model.train()
                 outputs = self.model(
                     masked_mel, 
+                    agent_mel_frames=agent_mel_shifted,
                     memory_embeddings=memory_embeddings, 
                     time_steps=time_steps
                 )

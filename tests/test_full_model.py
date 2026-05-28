@@ -23,28 +23,34 @@ def test_vanitas_model_forward():
     
     # Dummy inputs
     mel_frames = torch.randn(batch_size, seq_len, config.mel_bins)
+    agent_mel_frames = torch.randn(batch_size, seq_len, config.mel_bins)
     memory_embeddings = torch.randn(batch_size, 5, config.memory_dim)
     
-    # 1. Test inference (no time_steps)
+    # 1. Test inference (no time_steps, default agent feedback)
     model.eval()
     with torch.no_grad():
-        outputs = model(mel_frames, memory_embeddings)
+        outputs = model(mel_frames, memory_embeddings=memory_embeddings)
         audio = outputs["audio"]
         v_pred = outputs["v_pred"]
         think = outputs["think_gate"]
         
         assert audio is not None, "Inference should return audio waveforms"
         assert v_pred is None, "Inference shouldn't return velocity predictions"
-        
-        # Audio length = seq_len * hop_length
         assert audio.shape == (batch_size, 1, seq_len * config.hop_length)
         assert think.shape == (batch_size, seq_len, 1)
         
-    # 2. Test training (with time_steps)
+    # 2. Test inference (explicit agent feedback)
+    with torch.no_grad():
+        outputs = model(mel_frames, agent_mel_frames=agent_mel_frames, memory_embeddings=memory_embeddings)
+        audio = outputs["audio"]
+        assert audio is not None
+        assert audio.shape == (batch_size, 1, seq_len * config.hop_length)
+        
+    # 3. Test training (with time_steps)
     model.train()
     time_steps = torch.rand(batch_size, 1)
     
-    outputs = model(mel_frames, memory_embeddings, time_steps)
+    outputs = model(mel_frames, agent_mel_frames=agent_mel_frames, memory_embeddings=memory_embeddings, time_steps=time_steps)
     audio = outputs["audio"]
     v_pred = outputs["v_pred"]
     

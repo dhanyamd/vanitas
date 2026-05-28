@@ -235,8 +235,8 @@ class PerceptionStream(nn.Module):
         super().__init__()
         self.config = config
         
-        # Feature projection layer: raw 80 mel features -> 512 dimensions
-        self.input_projection = MelProjection(n_mels=config.mel_bins, model_dim=config.perception_dim)
+        # Feature projection layer: raw 160 mel features (80 user + 80 agent) -> 512 dimensions
+        self.input_projection = MelProjection(n_mels=config.mel_bins * 2, model_dim=config.perception_dim)
         
         # Stack of Mamba-2 blocks with residual connections
         self.layers = nn.ModuleList([
@@ -250,19 +250,24 @@ class PerceptionStream(nn.Module):
         # Final Perception State projection layer (d_model -> d_model)
         self.state_projection = nn.Linear(config.perception_dim, config.perception_dim)
 
-    def forward(self, mel_frames: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, mel_frames: torch.Tensor, agent_mel_frames: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Processes a sequence of log-mel spectrogram frames.
         
         Args:
             mel_frames: Tensor of shape (B, T, mel_bins)
+            agent_mel_frames: Optional tensor of shape (B, T, mel_bins)
             
         Returns:
             tuple[torch.Tensor, torch.Tensor]:
                 - layer_outputs: Tensor of shape (B, T, perception_dim) (all compressed frames)
                 - perception_state: Tensor of shape (B, perception_dim) (final compressed state snapshot)
         """
-        # Project continuous features: (B, T, mel_bins) -> (B, T, perception_dim)
-        x = self.input_projection(mel_frames)
+        if agent_mel_frames is None:
+            agent_mel_frames = torch.full_like(mel_frames, -5.0)
+            
+        # Project continuous features: (B, T, mel_bins * 2) -> (B, T, perception_dim)
+        combined_mel = torch.cat([mel_frames, agent_mel_frames], dim=-1)
+        x = self.input_projection(combined_mel)
         
         # Process Mamba-2 layers with residuals
         for layer in self.layers:
