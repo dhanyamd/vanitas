@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import logging
 from pathlib import Path
+from contextlib import nullcontext
 
 from vanitas.config import GlobalConfig
 from vanitas.model.vanitas import VanitasModel
@@ -132,7 +133,10 @@ class SpokenDialogueTrainer:
             masked_mel = batch["masked_mel"].to(self.device)
             mask_indices = batch["mask_indices"].to(self.device)
             turn_target = batch["turn_target"].to(self.device)
+            agent_active = batch["agent_active"].to(self.device)
             agent_mel = batch["agent_mel"].to(self.device)
+            agent_audio = batch["agent_audio"].to(self.device)
+            prosody_features = batch["prosody_features"].to(self.device)
             semantic_target = batch["semantic_target"].to(self.device)
             lengths = batch["lengths"].to(self.device)
             
@@ -148,30 +152,49 @@ class SpokenDialogueTrainer:
                 _, perception_state = self.model.perception(masked_mel, agent_mel_shifted)
                 memory_embeddings, _ = self.retriever(perception_state, top_k=2)
                 
-            # 2. Sample random timesteps t in [0, 1] for Flow Matching velocity predictions
+            # 2. Sample true flow-matching states.
             B_sz = masked_mel.shape[0]
             time_steps = torch.rand(B_sz, 1, device=self.device)
+            y0 = torch.randn_like(agent_mel)
+            t_view = time_steps.view(B_sz, 1, 1)
+            noisy_mel = (1.0 - t_view) * y0 + t_view * agent_mel
+            flow_target = agent_mel - y0
             
-            # 3. Model Forward: Outputs dict containing all stream logits/states
-            outputs = self.model(
-                masked_mel, 
-                agent_mel_frames=agent_mel_shifted,
-                memory_embeddings=memory_embeddings, 
-                time_steps=time_steps
-            )
-            
-            # 4. Compute Joint Loss
-            loss_dict = self.loss_fn(
-                model_outputs=outputs,
-                ground_truth_mel=mel_input,
-                mask_indices=mask_indices,
-                turn_targets=turn_target,
-                agent_mel=agent_mel,
-                semantic_target=semantic_target,
-                lengths=lengths
-            )
-            
-            loss = loss_dict["total_loss"]
+            # Automatic Mixed Precision for VRAM efficiency and GPU acceleration
+            device_type = self.device.type
+            autocast_dtype = torch.bfloat16 if device_type == "cuda" else torch.float16
+            autocast_ctx = torch.autocast(device_type=device_type, dtype=autocast_dtype) if device_type in {"cuda", "mps"} else nullcontext()
+
+            with autocast_ctx:
+                # 3. Model Forward: Outputs dict containing all stream logits/states
+                outputs = self.model(
+                    masked_mel, 
+                    agent_mel_frames=agent_mel_shifted,
+                    memory_embeddings=memory_embeddings, 
+                    time_steps=time_steps,
+                    noisy_mel=noisy_mel,
+                    target_agent_mel=agent_mel,
+                    target_agent_audio=agent_audio,
+                    prosody_features=prosody_features,
+                    lengths=lengths
+                )
+                
+                # 4. Compute Joint Loss
+                loss_dict = self.loss_fn(
+                    model_outputs=outputs,
+                    ground_truth_mel=mel_input,
+                    mask_indices=mask_indices,
+                    turn_targets=turn_target,
+                    agent_mel=agent_mel,
+                    semantic_target=semantic_target,
+                    lengths=lengths,
+                    flow_target=flow_target,
+                    speak_targets=agent_active,
+                    agent_active_mask=agent_active,
+                    agent_audio=agent_audio,
+                )
+                
+                loss = loss_dict["total_loss"]
             
             # Backward pass
             loss.backward()
@@ -232,7 +255,10 @@ class SpokenDialogueTrainer:
                 masked_mel = batch["masked_mel"].to(self.device)
                 mask_indices = batch["mask_indices"].to(self.device)
                 turn_target = batch["turn_target"].to(self.device)
+                agent_active = batch["agent_active"].to(self.device)
                 agent_mel = batch["agent_mel"].to(self.device)
+                agent_audio = batch["agent_audio"].to(self.device)
+                prosody_features = batch["prosody_features"].to(self.device)
                 semantic_target = batch["semantic_target"].to(self.device)
                 lengths = batch["lengths"].to(self.device)
                 
@@ -245,31 +271,50 @@ class SpokenDialogueTrainer:
                 _, perception_state = self.model.perception(masked_mel, agent_mel_shifted)
                 memory_embeddings, _ = self.retriever(perception_state, top_k=2)
                 
-                # Flow matching steps
+                # Flow matching states
                 B_sz = masked_mel.shape[0]
                 time_steps = torch.rand(B_sz, 1, device=self.device)
+                y0 = torch.randn_like(agent_mel)
+                t_view = time_steps.view(B_sz, 1, 1)
+                noisy_mel = (1.0 - t_view) * y0 + t_view * agent_mel
+                flow_target = agent_mel - y0
                 
-                # Forward — temporarily enable training mode so v_pred is produced
-                # (no_grad still prevents gradient computation and saves memory)
-                self.model.train()
-                outputs = self.model(
-                    masked_mel, 
-                    agent_mel_frames=agent_mel_shifted,
-                    memory_embeddings=memory_embeddings, 
-                    time_steps=time_steps
-                )
-                self.model.eval()
-                
-                # Loss
-                loss_dict = self.loss_fn(
-                    model_outputs=outputs,
-                    ground_truth_mel=mel_input,
-                    mask_indices=mask_indices,
-                    turn_targets=turn_target,
-                    agent_mel=agent_mel,
-                    semantic_target=semantic_target,
-                    lengths=lengths
-                )
+                # Automatic Mixed Precision for validation
+                device_type = self.device.type
+                autocast_dtype = torch.bfloat16 if device_type == "cuda" else torch.float16
+                autocast_ctx = torch.autocast(device_type=device_type, dtype=autocast_dtype) if device_type in {"cuda", "mps"} else nullcontext()
+
+                with autocast_ctx:
+                    # Forward — temporarily enable training mode so v_pred is produced
+                    # (no_grad still prevents gradient computation and saves memory)
+                    self.model.train()
+                    outputs = self.model(
+                        masked_mel, 
+                        agent_mel_frames=agent_mel_shifted,
+                        memory_embeddings=memory_embeddings, 
+                        time_steps=time_steps,
+                        noisy_mel=noisy_mel,
+                        target_agent_mel=agent_mel,
+                        target_agent_audio=agent_audio,
+                        prosody_features=prosody_features,
+                        lengths=lengths
+                    )
+                    self.model.eval()
+                    
+                    # Loss
+                    loss_dict = self.loss_fn(
+                        model_outputs=outputs,
+                        ground_truth_mel=mel_input,
+                        mask_indices=mask_indices,
+                        turn_targets=turn_target,
+                        agent_mel=agent_mel,
+                        semantic_target=semantic_target,
+                        lengths=lengths,
+                        flow_target=flow_target,
+                        speak_targets=agent_active,
+                        agent_active_mask=agent_active,
+                        agent_audio=agent_audio,
+                    )
                 
                 total_val_loss += loss_dict["total_loss"].item()
                 total_mel_loss += loss_dict["mel_loss"].item()
@@ -286,12 +331,23 @@ class SpokenDialogueTrainer:
             total_flow_loss / n_batches
         )
 
-    def fit(self):
+    def fit(self, start_epoch: int = 0):
         """Executes the complete training, learning rate schedules, evaluations, and checkpointing loops."""
         logger.info("Initializing SpokenDialogueTrainer fitting routine...")
         best_val_loss = float("inf")
         
-        for epoch in range(self.epochs):
+        # Load best validation loss from existing checkpoint if resuming
+        if start_epoch > 0:
+            checkpoint_path = self.config.checkpoints_dir / "best_model.pt"
+            if checkpoint_path.exists():
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                    best_val_loss = checkpoint.get("val_loss", float("inf"))
+                    logger.info(f"Resuming training from epoch {start_epoch}. Best validation loss so far: {best_val_loss:.4f}")
+                except Exception as e:
+                    logger.warning(f"Could not load best_val_loss from checkpoint: {e}")
+        
+        for epoch in range(start_epoch, self.epochs):
             # 1. Train one epoch
             train_loss, train_mel, train_gate, train_cog, train_flow = self.train_epoch(epoch)
             

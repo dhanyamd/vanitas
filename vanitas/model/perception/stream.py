@@ -138,59 +138,49 @@ class PyTorchMamba2Block(nn.Module):
         # A matrix: (nheads,) -> (B, L, nheads)
         A = -torch.exp(self.A_log) # Ensure negative eigenvalues for stability
         
-        # Linear Recurrent Scan: h_t = exp(A * dt) * h_{t-1} + (B * dt) * X
-        # For local execution, we run the scan sequentially or causally
-        ssm_outputs = []
+        # 3. State Space Duality (SSD) Parallel Computation
+        # S: Prefix sums of A * dt along the sequence dimension (L)
+        # u: (B, L, nheads)
+        u = A.unsqueeze(0).unsqueeze(0) * dt
+        S = torch.cumsum(u, dim=1) # (B, L, nheads)
         
-        # Head-wise loop (extremely clean and robust for MPS)
-        for h in range(self.nheads):
-            h_state = torch.zeros(B_sz, self.d_state, dtype=x.dtype, device=x.device)
-            head_out = torch.zeros(B_sz, L_sz, self.headdim, dtype=x.dtype, device=x.device)
-            
-            a_head = A[h]
-            dt_head = dt[:, :, h]  # (B, L)
-            
-            # Compute exponential decay: exp(A * dt)
-            decay = torch.exp(a_head * dt_head) # (B, L)
-            
-            # B and C head matrices
-            b_head = B_conv  # (B, L, d_state)
-            c_head = C_conv  # (B, L, d_state)
-            
-            x_head = X_heads[:, :, h, :] # (B, L, headdim)
-            
-            # Recurrence loop over time dimension (L)
-            for t in range(L_sz):
-                d_t = dt_head[:, t].unsqueeze(-1)    # (B, 1)
-                dec_t = decay[:, t].unsqueeze(-1)    # (B, 1)
-                b_t = b_head[:, t, :]                # (B, d_state)
-                c_t = c_head[:, t, :]                # (B, d_state)
-                x_t = x_head[:, t, :]                # (B, headdim)
-                
-                # Update hidden state: h_t = dec_t * h_{t-1} + (b_t * d_t) * x_t.T
-                # In SSD, the state is d_state-dimensional, combining across headdim
-                # We project input: (b_t * d_t) forms a state projection outer product
-                # For pure PyTorch validation, we update head state:
-                # We simplify the projection mapping:
-                # SSD acts as: head_state_t = dec * head_state_{t-1} + outer(b_t * d_t, x_t)
-                # output_t = head_state_t * c_t
-                # Let's perform state expansion: state is (B, d_state, headdim)
-                if t == 0:
-                    state = torch.zeros(B_sz, self.d_state, self.headdim, dtype=x.dtype, device=x.device)
-                
-                # outer product of B and X
-                proj_in = torch.bmm(b_t.unsqueeze(-1), x_t.unsqueeze(1)) # (B, d_state, headdim)
-                state = dec_t.unsqueeze(-1) * state + d_t.unsqueeze(-1) * proj_in
-                
-                # Output projection: Y = C * State
-                # C is (B, d_state), we contract along d_state to get (B, headdim)
-                y_t = torch.bmm(c_t.unsqueeze(1), state).squeeze(1) # (B, headdim)
-                head_out[:, t, :] = y_t
-                
-            ssm_outputs.append(head_out)
-            
-        # Concat heads together along head dimension: (B, L, inner_dim)
-        ssm_out = torch.cat(ssm_outputs, dim=-1)
+        # Permute S to (B, H, L)
+        S_heads = S.permute(0, 2, 1) # (B, nheads, L)
+        
+        # Compute pairwise difference: S_t - S_j
+        # S_heads.unsqueeze(3): (B, H, L, 1)
+        # S_heads.unsqueeze(2): (B, H, 1, L)
+        diff = S_heads.unsqueeze(3) - S_heads.unsqueeze(2) # (B, H, L, L)
+        
+        # Lower triangular mask to set j > t to -inf
+        mask = torch.tril(torch.ones(L_sz, L_sz, device=x.device, dtype=x.dtype))
+        mask_inf = (1.0 - mask) * -1e9
+        
+        # Decay matrix: exp(S_t - S_j) for j <= t, and 0 for j > t
+        decay_matrix = torch.exp(diff + mask_inf.unsqueeze(0).unsqueeze(0)) # (B, H, L, L)
+        
+        # Multiply by dt_j at each time step j (along columns / last dimension)
+        # dt.permute(0, 2, 1) has shape (B, H, L)
+        dt_heads = dt.permute(0, 2, 1)
+        decay_matrix = decay_matrix * dt_heads.unsqueeze(2) # (B, H, L, L)
+        
+        # Shared dot product matrix: K_tj = C_t * B_j
+        # C_conv: (B, L, d_state), B_conv: (B, L, d_state)
+        # K: (B, L, L)
+        K = torch.bmm(C_conv, B_conv.transpose(1, 2))
+        
+        # Combine shared K and head-specific decay
+        # L_matrix: (B, H, L, L)
+        L_matrix = K.unsqueeze(1) * decay_matrix
+        
+        # Permute X_heads to (B, H, L, headdim)
+        X_heads_perm = X_heads.permute(0, 2, 1, 3) # (B, H, L, headdim)
+        
+        # Batch matrix multiplication: Y_heads = L_matrix * X_heads_perm
+        Y_heads = torch.matmul(L_matrix, X_heads_perm) # (B, H, L, headdim)
+        
+        # Permute back to (B, L, H, headdim) and flatten head dimensions
+        ssm_out = Y_heads.permute(0, 2, 1, 3).reshape(B_sz, L_sz, self.d_inner)
         
         # 4. Multiplicative Gating
         gated = ssm_out * F.silu(gate)

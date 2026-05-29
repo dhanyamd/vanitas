@@ -2,6 +2,7 @@ import time
 import queue
 import threading
 import logging
+import os
 import numpy as np
 
 try:
@@ -27,6 +28,8 @@ class AudioPlayback:
         self.active_playing = False
         self.playback_thread = None
         self.interrupted = False
+        self.output_gain = float(os.environ.get("VANITAS_PLAYBACK_GAIN", "4.0"))
+        self.peak_target = float(os.environ.get("VANITAS_PLAYBACK_PEAK", "0.85"))
         
         # Check if actual sound card exists
         self.has_physical_device = False
@@ -82,6 +85,13 @@ class AudioPlayback:
         # Ensure correct shape
         if len(audio_data.shape) == 1:
             audio_data = audio_data.reshape(-1, self.channels)
+
+        # Boost low-amplitude synthesis so speech is actually audible.
+        audio_data = audio_data.astype(np.float32, copy=False)
+        peak = float(np.max(np.abs(audio_data))) if audio_data.size > 0 else 0.0
+        if peak > 1e-6:
+            scale = min(self.output_gain, self.peak_target / peak)
+            audio_data = np.clip(audio_data * scale, -1.0, 1.0)
             
         # Push to queue in chunks (smaller chunks enable faster interruption response)
         chunk_size = 2048
@@ -128,24 +138,27 @@ class AudioPlayback:
             
             if self.has_physical_device:
                 try:
-                    # Initialize active stream on-demand to support dynamic stop/close operations
-                    self.stream = sd.OutputStream(
-                        samplerate=self.sample_rate,
-                        channels=self.channels,
-                        dtype=self.dtype
-                    )
-                    self.stream.start()
-                    
-                    # Write block synchronously (since it's a dedicated background thread)
+                    # Keep stream open across chunks to avoid dropouts/clicks.
+                    if self.stream is None:
+                        self.stream = sd.OutputStream(
+                            samplerate=self.sample_rate,
+                            channels=self.channels,
+                            dtype=self.dtype
+                        )
+                        self.stream.start()
+
+                    # Write block synchronously (dedicated thread).
                     self.stream.write(chunk)
-                    
-                    if self.stream is not None:
-                        self.stream.stop()
-                        self.stream.close()
-                        self.stream = None
                 except Exception as e:
                     logger.error(f"Sounddevice playback error: {e}. Switching to virtual playback.")
                     self.has_physical_device = False
+                    if self.stream is not None:
+                        try:
+                            self.stream.stop()
+                            self.stream.close()
+                        except Exception:
+                            pass
+                        self.stream = None
             
             # Virtual playback fallback: sleep to simulate physical playback duration
             if not self.has_physical_device and not self.interrupted:
@@ -159,6 +172,13 @@ class AudioPlayback:
                     elapsed += sleep_len
 
         self.active_playing = False
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
 
     def __enter__(self):
         self.start()

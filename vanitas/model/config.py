@@ -33,3 +33,4 @@ class VanitasModelConfig:
     
     # Training & Regularization
     dropout: float = 0.1
+    adapter_rank: int = 8             # Zero-init adapters for customer/domain fine-tuning

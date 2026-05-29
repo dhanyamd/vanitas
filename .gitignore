@@ -5,7 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.pt
 # Distribution / packaging
 .Python
 build/
@@ -117,6 +117,8 @@ venv.bak/
 
 # Project checkpoints
 checkpoints/
+scratch/smoke_checkpoints/
+**/*.pt
 
 # IDE files
 .vscode/

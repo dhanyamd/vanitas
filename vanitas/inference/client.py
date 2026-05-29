@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -44,7 +45,8 @@ class VanitasTerminalClient:
         self.is_running = False
         self.agent_speaking = False
         self.agent_thinking = False
-        self.barge_in_threshold = 0.02
+        self.barge_in_threshold = float(os.environ.get("VANITAS_BARGE_IN_THRESHOLD", "0.20"))
+        self.enable_local_barge_in = str(os.environ.get("VANITAS_ENABLE_LOCAL_BARGE_IN", "0")).lower() in {"1", "true", "yes"}
         self.matched_facts = []
 
     def draw_hud(self, rms_energy: float = 0.0):
@@ -112,7 +114,7 @@ class VanitasTerminalClient:
                 break
                 
             # If the user speaks while the agent is speaking, trigger local client barge-in instantly!
-            if self.agent_speaking and rms > self.barge_in_threshold:
+            if self.enable_local_barge_in and self.agent_speaking and rms > self.barge_in_threshold:
                 logger.info("Local barge-in detected. Stopping output stream...")
                 self.playback.interrupt()
                 self.agent_speaking = False

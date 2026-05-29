@@ -48,6 +48,16 @@ def populate_memory(retriever):
     logger.info(f"Vector Database populated with {len(KNOWLEDGE_BASE)} facts.")
 
 
+def _config_from_checkpoint(checkpoint: dict) -> VanitasModelConfig:
+    raw_config = checkpoint.get("config") or checkpoint.get("model_config")
+    if isinstance(raw_config, VanitasModelConfig):
+        return raw_config
+    if isinstance(raw_config, dict):
+        valid_keys = VanitasModelConfig.__dataclass_fields__.keys()
+        return VanitasModelConfig(**{k: v for k, v in raw_config.items() if k in valid_keys})
+    return VanitasModelConfig()
+
+
 class VanitasInferenceServer:
     def __init__(self, host: str = "localhost", port: int = 8000, checkpoint_path: str = "checkpoints/best_model.pt",
                  think_threshold: float = 0.45, speak_threshold: float = 0.45):
@@ -80,7 +90,44 @@ class VanitasInferenceServer:
         # Settings for Gating
         self.think_threshold = think_threshold
         self.speak_threshold = speak_threshold
-        self.barge_in_threshold = 0.02  # RMS energy to trigger barge-in
+        self.barge_in_threshold = 0.15  # RMS energy to trigger barge-in
+        # Runtime guards to avoid micro-utterances and choppy retriggers.
+        self.min_context_frames = 40          # ~400ms at 10ms/frame
+        self.min_response_samples = 3200      # ~200ms at 16kHz
+        self.speak_cooldown_s = 0.35
+        # Fallback VAD turn-end trigger when learned speak gate is too conservative.
+        self.voice_activity_threshold = 0.015
+        self.end_of_turn_silence_s = 0.45
+
+    def _prepare_generated_audio(self, audio_np: np.ndarray) -> np.ndarray:
+        """Trim leading/trailing near-silence and normalize neural audio for playback."""
+        audio_np = np.nan_to_num(audio_np.astype(np.float32, copy=False))
+        if audio_np.size == 0:
+            return audio_np
+
+        peak = float(np.max(np.abs(audio_np)))
+        rms = float(np.sqrt(np.mean(audio_np**2)))
+        logger.info(f"Generated audio stats before trim: samples={len(audio_np)}, rms={rms:.6f}, peak={peak:.6f}")
+        if peak < 1e-6:
+            return np.zeros(0, dtype=np.float32)
+
+        frame = 320
+        threshold = max(0.002, 0.08 * peak)
+        active = []
+        for start in range(0, len(audio_np), frame):
+            chunk = audio_np[start:start + frame]
+            active.append(float(np.sqrt(np.mean(chunk**2))) > threshold if len(chunk) else False)
+
+        if any(active):
+            first = active.index(True) * frame
+            last = (len(active) - 1 - active[::-1].index(True) + 1) * frame
+            pad = int(0.05 * self.model_config.sample_rate)
+            audio_np = audio_np[max(0, first - pad):min(len(audio_np), last + pad)]
+
+        peak = float(np.max(np.abs(audio_np))) if audio_np.size else 0.0
+        if peak > 1e-6:
+            audio_np = np.clip(audio_np * min(8.0, 0.85 / peak), -1.0, 1.0)
+        return audio_np.astype(np.float32, copy=False)
 
     def _load_model_checkpoint(self):
         """Loads VanitasModel state dict and config from disk."""
@@ -102,9 +149,21 @@ class VanitasInferenceServer:
         else:
             logger.info(f"Loading model checkpoint from '{path}'...")
             checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-            config = checkpoint["config"]
+            config = _config_from_checkpoint(checkpoint)
             model = VanitasModel(config)
-            model.load_state_dict(checkpoint["model_state_dict"])
+            state_dict = checkpoint.get("model_state_dict", checkpoint)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            old_dummy_vocoder = any(k.startswith("vocoder.dummy_conv") for k in state_dict)
+            missing_corrected_flow = any(k.startswith("flow_head.mel_mlp") for k in missing)
+            if old_dummy_vocoder or missing_corrected_flow:
+                logger.warning(
+                    "Checkpoint predates the corrected production/vocoder path. "
+                    "It may load, but clear speech should not be expected until corrective retraining is run."
+                )
+            if missing:
+                logger.info("Checkpoint load: %d missing keys initialized from current code.", len(missing))
+            if unexpected:
+                logger.info("Checkpoint load: %d unused checkpoint keys ignored.", len(unexpected))
             
         model.to(self.device)
         model.eval()
@@ -149,6 +208,9 @@ class VanitasInferenceServer:
         agent_speaking = False
         session = {"interrupted": False}
         response_task = None
+        last_speak_time = 0.0
+        had_voice_since_last_response = False
+        last_voice_time = 0.0
         
         async def generate_and_stream_response(model_outputs):
             nonlocal agent_speaking, pending_agent_mel_frames
@@ -159,6 +221,13 @@ class VanitasInferenceServer:
                     return
                 
                 audio_np = audio_tensor.detach().cpu().numpy().flatten()
+                audio_np = self._prepare_generated_audio(audio_np)
+                if len(audio_np) < self.min_response_samples:
+                    logger.info(
+                        f"Skipping micro-response ({len(audio_np)} samples < {self.min_response_samples}). "
+                        "Waiting for more context before speaking."
+                    )
+                    return
                 logger.info(f"Response synthesis complete. Generated {len(audio_np)} samples (~{len(audio_np)/16000:.2f}s). Streaming to client...")
                 
                 # Convert generated audio into agent mel frames
@@ -222,6 +291,12 @@ class VanitasInferenceServer:
                         continue
                         
                     rms = np.sqrt(np.mean(pcm_data**2))
+                    now = asyncio.get_event_loop().time()
+
+                    # Track simple VAD to provide a robust fallback turn-end trigger.
+                    if rms > self.voice_activity_threshold:
+                        had_voice_since_last_response = True
+                        last_voice_time = now
                     
                     if agent_speaking and rms > self.barge_in_threshold:
                         logger.info(f"🎙️ User barge-in detected via energy threshold (RMS={rms:.4f})! Interrupting agent...")
@@ -309,13 +384,29 @@ class VanitasInferenceServer:
                         }))
                         
                     # 2. Speak Gate fires: trigger speech response synthesis
-                    if speak_val > self.speak_threshold and not agent_speaking:
+                    has_min_context = user_mel_history is not None and user_mel_history.size(1) >= self.min_context_frames
+                    cooldown_ok = (now - last_speak_time) >= self.speak_cooldown_s
+                    if speak_val > self.speak_threshold and not agent_speaking and has_min_context and cooldown_ok:
                         logger.info(f"🗣️ Speak Gate Fired ({speak_val:.3f}). Initializing generation...")
                         agent_speaking = True
                         session["interrupted"] = False
+                        last_speak_time = now
+                        had_voice_since_last_response = False
                         
                         # Start async streaming task
                         response_task = asyncio.create_task(generate_and_stream_response(outputs))
+                    elif not agent_speaking and has_min_context and cooldown_ok and had_voice_since_last_response:
+                        silence_elapsed = now - last_voice_time
+                        if silence_elapsed >= self.end_of_turn_silence_s:
+                            logger.info(
+                                f"🟡 Fallback turn-end trigger fired (silence={silence_elapsed:.2f}s, "
+                                f"speak_gate={speak_val:.3f}). Initializing generation..."
+                            )
+                            agent_speaking = True
+                            session["interrupted"] = False
+                            last_speak_time = now
+                            had_voice_since_last_response = False
+                            response_task = asyncio.create_task(generate_and_stream_response(outputs))
                         
         except websockets.exceptions.ConnectionClosed:
             logger.info("Client connection closed.")

@@ -1,199 +1,298 @@
+"""
+Vanitas Cloud Training — Modal Deployment Script
+=================================================
+Usage:
+  modal run train_modal.py             # Spawn A100 training on real data
+  modal run --detach train_modal.py    # Close laptop safely after launch
+"""
 import os
 import sys
-import click
+import logging
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vanitas.train")
 
 # Add project root to python path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Import Modal
-try:
-    import modal
-    MODAL_AVAILABLE = True
-except ImportError:
-    MODAL_AVAILABLE = False
+import modal
 
-# Modal App definition (only defined if modal is installed)
-if MODAL_AVAILABLE:
-    # Standard image definition with GPU libraries
-    vanitas_image = (
-        modal.Image.debian_slim(python_version="3.10")
-        .apt_install("libsndfile1", "git") # libsndfile is required by soundfile/torchaudio
-        .pip_install(
-            "numpy>=1.26.0",
-            "scipy>=1.12.0",
-            "librosa>=0.10.0",
-            "torch>=2.2.0",
-            "torchaudio>=2.2.0",
-            "einops>=0.8.0",
-            "datasets>=3.0.0",
-            "huggingface_hub>=0.20.0",
-            "wandb>=0.18.0",
-            "click>=8.1.0",
-            "soundfile>=0.12.1",
-            "chromadb>=0.4.0"
-        )
-        # Install optimized Mamba CUDA kernels - these compile cleanly inside CUDA environment
-        .pip_install("causal-conv1d>=1.4.0", "mamba-ssm>=2.2.0", pre=True)
-        .add_local_dir(
-            str(Path(__file__).resolve().parent / "vanitas"),
-            remote_path="/root/vanitas"
-        )
+# ---------------------------------------------------------------------------
+# Modal Image — PyTorch base with CUDA toolkit
+# ---------------------------------------------------------------------------
+vanitas_image = (
+    modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel")
+    .apt_install("libsndfile1", "git")
+    .run_commands(
+        "pip install -q uv && "
+        "uv pip install --system "
+        "'numpy>=1.26.0' "
+        "'scipy>=1.12.0' "
+        "'librosa>=0.10.0' "
+        "'torchaudio>=2.4.0' "
+        "'einops>=0.8.0' "
+        "'datasets>=3.0.0' "
+        "'huggingface_hub>=0.20.0' "
+        "'soundfile>=0.12.1' "
+        "'safetensors>=0.4.0'"
     )
-    
-    app = modal.App(name="vanitas-training")
-    
-    # Define a persistent volume for storing model checkpoints securely in the cloud
-    checkpoints_volume = modal.Volume.from_name("vanitas-checkpoints", create_if_missing=True)
+    # Copy the vanitas package into the container
+    .add_local_dir(
+        str(Path(__file__).resolve().parent / "vanitas"),
+        remote_path="/root/vanitas",
+    )
+)
 
+app = modal.App(name="vanitas-training")
 
-# Local execution helper
-def run_local_training(epochs: int, batch_size: int):
-    """Executes a short, local training dry-run on Apple Silicon or CPU using mock conversations."""
-    print("="*70)
-    print("🔬 RUNNING LOCAL DRY-RUN PROTOTYPE TRAINING 🔬")
-    print("="*70)
-    
+# Persistent volume for checkpoints — survives across runs
+checkpoints_volume = modal.Volume.from_name("vanitas-checkpoints", create_if_missing=True)
+hf_cache_volume = modal.Volume.from_name("vanitas-hf-cache", create_if_missing=True)
+
+# ---------------------------------------------------------------------------
+# Cloud Training Function (runs on A100)
+# ---------------------------------------------------------------------------
+@app.function(
+    image=vanitas_image,
+    gpu="A100",
+    timeout=21600,  # 6 hours; avoids timeout near the end of 50-epoch runs
+    volumes={
+        "/root/checkpoints": checkpoints_volume,
+        "/root/.cache/huggingface": hf_cache_volume,
+    },
+)
+def train_cloud(epochs: int = 50, batch_size: int = 16, lr: float = 2e-4):
+    """Runs the full training loop on a dedicated A100 GPU in the cloud."""
+    import torch
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+
+    print("=" * 70)
+    print("⚡ CLOUD GPU TRAINING INITIATED (MODAL A100) ⚡")
+    print("=" * 70)
+
+    # Imports inside the container (vanitas is at /root/vanitas)
+    sys.path.insert(0, "/root")
     from vanitas.config import GlobalConfig
     from vanitas.model.vanitas import VanitasModel
+    from vanitas.model.config import VanitasModelConfig
     from vanitas.training.dataset import SpokenDialogueDataset
     from vanitas.training.trainer import SpokenDialogueTrainer
-    
-    config = GlobalConfig()
-    
-    print("\n[Step 1] Initializing Vanitas Model Configuration...")
-    from vanitas.model.config import VanitasModelConfig
+
+    # ── Step 1: CUDA verification ──────────────────────────────────────
+    print(f"\n[1/5] CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"      GPU: {torch.cuda.get_device_name(0)}")
+        print(f"      VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # ── Step 2: Model init ─────────────────────────────────────────────
+    print("\n[2/5] Initializing Vanitas Model (~85M params)...")
     model_config = VanitasModelConfig(
-        perception_layers=2, # Scale layers down to 2 for instant compilation and execution
-        cognition_layers=2,
-        production_layers=2,
-        perception_dim=128,   # Scale dim to 128
-        cognition_dim=128,
-        production_dim=128,
-        memory_dim=128,
-        gate_hidden_dim=64
+        perception_dim=512,
+        perception_layers=12,
+        perception_state_dim=64,
+        gate_hidden_dim=256,
     )
     model = VanitasModel(model_config)
-    print("Vanitas model structure successfully initialized.")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"      Parameters: {total_params:,} (~{total_params / 1e6:.1f}M)")
+
+    # ── Step 3: Dataset (REAL DATA — NO MOCK) ──────────────────────────
+    print("\n[3/5] Loading REAL DailyTalkContiguous audio from Hugging Face...")
+    print("      Hugging Face cache is persisted in the vanitas-hf-cache Modal volume.")
+    config = GlobalConfig()
+    config.checkpoints_dir = Path("/root/checkpoints")
+    config.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    train_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="train", use_mock=False)
+    val_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="val", use_mock=False)
+    print(f"      Train: {len(train_ds)} dialogues | Val: {len(val_ds)} dialogues")
     
-    print("\n[Step 2] Loading local mock training and validation datasets...")
-    # Force use of mock synthetic data to guarantee it runs offline instantly
-    train_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="train", max_samples=4, use_mock=True)
-    val_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="val", max_samples=2, use_mock=True)
-    print(f"Loaded {len(train_ds)} train and {len(val_ds)} validation mock dialogues.")
-    
-    print(f"\n[Step 3] Initializing SpokenDialogueTrainer for {epochs} epochs...")
+    if len(train_ds) == 0:
+        raise RuntimeError("FATAL: No real training data loaded! Refusing to train on empty dataset.")
+
+    # ── Step 4: Train ──────────────────────────────────────────────────
+    print(f"\n[4/5] Starting training: {epochs} epochs, batch={batch_size}, lr={lr}")
     trainer = SpokenDialogueTrainer(
         model=model,
         train_dataset=train_ds,
         val_dataset=val_ds,
         config=config,
-        lr=5e-4,
+        lr=lr,
         batch_size=batch_size,
         epochs=epochs,
-        use_wandb=False # No wandb for local debug
+        use_wandb=False,
+        project_name="vanitas-perception-stream",
     )
-    
-    print("\n[Step 4] Starting training loop...")
-    trainer.fit()
-    
-    print("\n🟢 Local diagnostic training dry-run finished successfully!")
-    print(f"Checkpoints saved in: '{config.checkpoints_dir}'")
-    print("="*70)
 
-
-# Modal Cloud Entry Point
-if MODAL_AVAILABLE:
-    @app.function(
-        image=vanitas_image,
-        gpu="A100", # Secure NVIDIA A100 GPU (40GB or 80GB)
-        timeout=7200, # 2 hours max run time
-        volumes={"/root/checkpoints": checkpoints_volume}
-    )
-    def train_cloud(epochs: int = 50, batch_size: int = 16, lr: float = 2e-4, use_wandb: bool = False):
-        """Runs the full academic training loop in the cloud on a dedicated A100 GPU."""
-        print("="*70)
-        print("⚡ CLOUD GPU TRAINING INITIATED (MODAL A100) ⚡")
-        print("="*70)
-        
-        import torch
-        from vanitas.config import GlobalConfig
-        from vanitas.model.vanitas import VanitasModel
-        from vanitas.model.config import VanitasModelConfig
-        from vanitas.training.dataset import SpokenDialogueDataset
-        from vanitas.training.trainer import SpokenDialogueTrainer
-        
-        # Override config paths for container directory structures
-        config = GlobalConfig()
-        config.checkpoints_dir = Path("/root/checkpoints")
-        config.checkpoints_dir.mkdir(parents=True, exist_ok=True)
-        
-        print("\n[Step 1] Initializing CUDA Device Verification...")
-        print(f"CUDA Available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            print(f"GPU Device: {torch.cuda.get_device_name(0)}")
+    start_epoch = 0
+    best_path = "/root/checkpoints/best_model.pt"
+    if os.path.exists(best_path):
+        try:
+            print(f"      Found existing checkpoint at {best_path}. Resuming training...")
+            checkpoint = torch.load(best_path, map_location=trainer.device, weights_only=False)
             
-        print("\n[Step 2] Initializing full academic Vanitas Model (~85M params)...")
-        # Full hyperparameter targets for paper benchmarks
-        model_config = VanitasModelConfig(
-            perception_dim=512,
-            perception_layers=12,
-            perception_state_dim=64,
-            gate_hidden_dim=256
-        )
-        model = VanitasModel(model_config)
-        
-        print("\n[Step 3] Downloading 'kyutai/DailyTalkContiguous' dataset from Hugging Face...")
-        train_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="train", use_mock=False)
-        val_ds = SpokenDialogueDataset(config=config, model_config=model_config, split="val", use_mock=False)
-        print(f"Downloaded {len(train_ds)} train dialogues and {len(val_ds)} validation dialogues.")
-        
-        # Log parameter count
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Total Model Parameter Count: {total_params:,} (~{total_params/1e6:.1f}M)")
-        
-        print("\n[Step 4] Starting Cloud Trainer...")
-        trainer = SpokenDialogueTrainer(
-            model=model,
-            train_dataset=train_ds,
-            val_dataset=val_ds,
-            config=config,
-            lr=lr,
-            batch_size=batch_size,
-            epochs=epochs,
-            use_wandb=use_wandb,
-            project_name="vanitas-perception-stream"
-        )
-        
-        trainer.fit()
-        
-        # Commit checkpoint volume changes to cloud storage
-        checkpoints_volume.commit()
-        print("\n⚡ Cloud GPU training finalized! Checkpoints securely synced to persistent volume. ⚡")
-        print("="*70)
+            # Load model state dict. New production/vocoder layers can be
+            # initialized while preserving the already trained streams.
+            missing, unexpected = trainer.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            if missing:
+                print(f"      New parameters initialized from scratch: {len(missing)}")
+            if unexpected:
+                print(f"      Ignored checkpoint parameters no longer used: {len(unexpected)}")
 
+            outdated_production = any(k.startswith("flow_head.mel_mlp") for k in missing) or any(
+                k.startswith("vocoder.dummy_conv") for k in unexpected
+            )
+            if outdated_production:
+                print("      Outdated production checkpoint detected; resetting production/vocoder/speak-gate modules.")
+                modules_to_reset = [
+                    trainer.model.production_stream,
+                    trainer.model.flow_head,
+                    trainer.model.vocoder,
+                    trainer.model.gates.gate_cg,
+                ]
+                for module in modules_to_reset:
+                    for child in module.modules():
+                        if hasattr(child, "reset_parameters"):
+                            child.reset_parameters()
+                trainer.model.flow_head.mel_mlp[-1].weight.data.zero_()
+                trainer.model.flow_head.mel_mlp[-1].bias.data.zero_()
+                trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=lr, weight_decay=1e-4)
+                trainer.scheduler = CosineAnnealingLR(trainer.optimizer, T_max=epochs, eta_min=1e-6)
+                start_epoch = 0
+            elif "optimizer_state_dict" in checkpoint:
+                try:
+                    trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                except Exception as opt_e:
+                    print(f"      Optimizer state incompatible with new layers; restarting optimizer: {opt_e}")
+                
+                start_epoch = checkpoint.get("epoch", -1) + 1
+                print(f"      Successfully loaded checkpoint from epoch {start_epoch - 1}. Fast-forwarding LR scheduler...")
+                
+                # Fast-forward LR scheduler to the correct epoch
+                for _ in range(start_epoch):
+                    trainer.scheduler.step()
+        except Exception as e:
+            print(f"      ⚠️ Failed to load checkpoint: {e}. Starting from scratch.")
+            start_epoch = 0
 
-# CLI interface to execute script locally or trigger cloud
-@click.command()
-@click.option("--local", is_flag=True, help="Run a short local training dry-run on Apple Silicon or CPU.")
-@click.option("--epochs", default=2, help="Number of training epochs.")
-@click.option("--batch-size", default=4, help="Batch size for training.")
-@click.option("--lr", default=2e-4, help="Learning rate.")
-@click.option("--wandb", is_flag=True, help="Log metrics to Weights & Biases.")
-def main(local, epochs, batch_size, lr, wandb):
-    """🚀 Modal Runner for training the Vanitas Perception Stream & learned gates."""
-    if local:
-        run_local_training(epochs=epochs, batch_size=batch_size)
-    else:
-        if not MODAL_AVAILABLE:
-            print("❌ Modal library not found. Install modal via `pip install modal` and setup auth.")
-            sys.exit(1)
+    trainer.fit(start_epoch=start_epoch)
+
+    # Persist checkpoints and dataset cache to Modal Volumes
+    checkpoints_volume.commit()
+    hf_cache_volume.commit()
+    print("\n✅ Training complete! Checkpoints saved to vanitas-checkpoints volume.")
+
+    # ── Step 5: Push model to Hugging Face ─────────────────────────────
+    print("\n[5/5] Pushing trained model to Hugging Face Hub...")
+    try:
+        from huggingface_hub import HfApi, login
+        
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if not hf_token:
+            print("  ⚠️ HF_TOKEN is not set; skipping Hugging Face upload.")
+            print("     Checkpoints remain saved in the Modal volume.")
+            print("=" * 70)
+            return
+
+        login(token=hf_token)
+        
+        api = HfApi()
+        repo_id = os.environ.get("HF_REPO_ID", "md13/vanitas-sft")
+        
+        # Create the repo (or use existing)
+        api.create_repo(repo_id=repo_id, exist_ok=True, private=False)
+        
+        # Upload best model checkpoint
+        best_path = "/root/checkpoints/best_model.pt"
+        final_path = "/root/checkpoints/final_model.pt"
+        
+        if os.path.exists(best_path):
+            api.upload_file(
+                path_or_fileobj=best_path,
+                path_in_repo="best_model.pt",
+                repo_id=repo_id,
+            )
+            print(f"  ✅ Uploaded best_model.pt to {repo_id}")
             
-        print("🚀 Deploying A100 GPU training job to Modal cloud...")
-        # Triggering cloud function
-        with modal.enable_output():
-            # Standard cloud launch parameters
-            train_cloud.remote(epochs=epochs, batch_size=batch_size, lr=lr, use_wandb=wandb)
+        if os.path.exists(final_path):
+            api.upload_file(
+                path_or_fileobj=final_path,
+                path_in_repo="final_model.pt",
+                repo_id=repo_id,
+            )
+            print(f"  ✅ Uploaded final_model.pt to {repo_id}")
+        
+        # Upload model config as JSON
+        import json
+        from dataclasses import asdict
+        config_dict = asdict(model_config)
+        config_json = json.dumps(config_dict, indent=2)
+        api.upload_file(
+            path_or_fileobj=config_json.encode(),
+            path_in_repo="config.json",
+            repo_id=repo_id,
+        )
+        print(f"  ✅ Uploaded config.json to {repo_id}")
+        
+        # Create a model card
+        model_card = f"""---
+tags:
+- vanitas
+- spoken-dialogue
+- mamba-ssm
+- flow-matching
+license: mit
+datasets:
+- kyutai/DailyTalkContiguous
+---
 
-if __name__ == "__main__":
-    main()
+# Vanitas SFT Model
+
+Supervised fine-tuned model for real-time spoken dialogue, trained on the [kyutai/DailyTalkContiguous](https://huggingface.co/datasets/kyutai/DailyTalkContiguous) dataset.
+
+## Architecture
+- **Perception Stream**: Mamba-2 SSM ({model_config.perception_layers} layers, d={model_config.perception_dim})
+- **Cognition Core**: Sparse Attention ({model_config.cognition_layers} layers, d={model_config.cognition_dim})
+- **Production Stream**: Mamba-2 + Flow Matching ({model_config.production_layers} layers, d={model_config.production_dim})
+- **Parameters**: {total_params:,} (~{total_params / 1e6:.1f}M)
+
+## Training
+- **Dataset**: kyutai/DailyTalkContiguous ({len(train_ds)} train / {len(val_ds)} val dialogues)
+- **Epochs**: {epochs}
+- **Batch Size**: {batch_size}
+- **Learning Rate**: {lr}
+- **Hardware**: NVIDIA A100 (Modal Cloud)
+"""
+        api.upload_file(
+            path_or_fileobj=model_card.encode(),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+        )
+        print(f"  ✅ Uploaded README.md to {repo_id}")
+        print(f"\n🎉 Model published at: https://huggingface.co/{repo_id}")
+        
+    except Exception as e:
+        print(f"  ⚠️ Failed to push to HF: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint — `modal run train_modal.py` triggers this
+# ---------------------------------------------------------------------------
+@app.local_entrypoint()
+def main(epochs: int = 50, batch_size: int = 16, lr: float = 2e-4):
+    """Launch cloud training. Use `modal run --detach train_modal.py` to close your laptop."""
+    print("🚀 Launching A100 training job on Modal...")
+    print("   Training on REAL kyutai/DailyTalkContiguous dataset (NO MOCK DATA)")
+    print("   Checkpoints will be saved to the Modal volume.")
+    print("   Run upload_to_hf.py after training to publish the corrected checkpoint.")
+    print("   You can safely close your terminal after the image builds.")
+    print("   Monitor the run from your Modal dashboard.\n")
+    # Using .spawn() instead of .remote() ensures the detached run is not liable
+    # to cancellation when the local process exits/disconnects.
+    train_cloud.spawn(epochs=epochs, batch_size=batch_size, lr=lr)
+    print("\n✅ Training job spawned successfully on the cloud!")

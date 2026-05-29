@@ -2,41 +2,22 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import logging
-import hashlib
 
-try:
-    from datasets import load_dataset
-    HF_DATASETS_AVAILABLE = True
-except ImportError:
-    HF_DATASETS_AVAILABLE = False
-
+import os
+import json
+import soundfile as sf
+from huggingface_hub import hf_hub_download
 from vanitas.config import GlobalConfig
 from vanitas.model.config import VanitasModelConfig
+from vanitas.model.cognition.text_embedding import lexical_text_embedding
 from vanitas.audio.features import MelExtractor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vanitas.training.dataset")
 
 def deterministic_text_embedding(text: str, embedding_dim: int = 512) -> torch.Tensor:
-    """Deterministically encodes a text string into a float32 vector of size `embedding_dim` using SHA-256.
-    Acts as a reliable, dependency-free text encoder fallback.
-    """
-    hasher = hashlib.sha256(text.encode("utf-8"))
-    hash_bytes = hasher.digest()
-    
-    # Use hash bytes to seed a deterministic random generator
-    seed = int.from_bytes(hash_bytes[:4], byteorder="big")
-    rng = np.random.default_rng(seed)
-    
-    # Generate random normal vector
-    vector = rng.normal(0.0, 0.1, embedding_dim).astype(np.float32)
-    
-    # Normalize vector
-    norm = np.linalg.norm(vector)
-    if norm > 0:
-        vector = vector / norm
-        
-    return torch.from_numpy(vector)
+    """Dependency-free lexical embedding used for memory alignment targets."""
+    return lexical_text_embedding(text, embedding_dim=embedding_dim)
 
 class SpokenDialogueDataset(Dataset):
     """Loads stereo conversational speech, separates channels, and computes on-the-fly Mel features and turn-taking targets."""
@@ -60,52 +41,98 @@ class SpokenDialogueDataset(Dataset):
         self.data_samples = []
         
         # Load dataset
-        if HF_DATASETS_AVAILABLE and not self.use_mock:
+        if not self.use_mock:
             try:
-                logger.info(f"Attempting to download/load 'kyutai/DailyTalkContiguous' ({self.split} split) from Hugging Face...")
-                ds = load_dataset("kyutai/DailyTalkContiguous", split=self.split)
-                
-                # Slicing if requested
-                num_items = len(ds)
-                if self.max_samples is not None:
-                    num_items = min(num_items, self.max_samples)
-                    
-                logger.info(f"Loaded {num_items} conversation tracks successfully.")
-                
-                for idx in range(num_items):
-                    item = ds[idx]
-                    audio_info = item["audio"]
-                    array = np.array(audio_info["array"])
-                    sr = audio_info["sampling_rate"]
-                    
-                    # Robust transcript extraction
-                    text_context = ""
-                    if "text" in item:
-                        text_context = item["text"]
-                    elif "transcript" in item:
-                        text_context = item["transcript"]
-                    elif "dialogue" in item:
-                        if isinstance(item["dialogue"], list):
-                            text_context = " ".join([t.get("content", t.get("text", "")) for t in item["dialogue"]])
-                        else:
-                            text_context = str(item["dialogue"])
-                    else:
-                        text_context = f"Spoken dialog conversation transcript for sample {idx}"
-                    
-                    # Ensure shape is (channels, samples)
-                    if array.shape[0] != 2:
-                        array = array.T # Transpose to (2, N)
-                        
-                    self.data_samples.append({
-                        "array": array,
-                        "sample_rate": sr,
-                        "text_context": text_context
-                    })
+                self._load_real_dataset()
             except Exception as e:
-                logger.warning(f"Failed to load dataset from HF ({e}). Falling back to synthetic mock data.")
+                logger.error(f"Failed to load real dataset from HF: {e}")
+                import traceback
+                traceback.print_exc()
+                logger.warning("Falling back to synthetic mock data.")
                 self._load_mock_samples()
         else:
             self._load_mock_samples()
+
+    def _load_real_dataset(self):
+        """Downloads WAV files from kyutai/DailyTalkContiguous and loads real stereo audio.
+        
+        Bypasses the HF `datasets` library entirely to avoid CastError on the
+        `alignments` column. Instead, downloads the JSONL manifest directly and
+        fetches each WAV file individually.
+        """
+        
+        logger.info("Downloading manifest (dailytalk.jsonl) from kyutai/DailyTalkContiguous...")
+        
+        # Step 1: Download the JSONL manifest directly (no datasets library)
+        manifest_path = hf_hub_download(
+            repo_id="kyutai/DailyTalkContiguous",
+            filename="dailytalk.jsonl",
+            repo_type="dataset",
+        )
+        
+        # Step 2: Parse the manifest — each line is {"path": "data_stereo/N.wav", "duration": float, ...}
+        manifest = []
+        with open(manifest_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    manifest.append({"path": entry["path"], "duration": entry["duration"]})
+        
+        total = len(manifest)
+        logger.info(f"Found {total} conversation tracks in manifest.")
+        
+        # Step 3: Split — first 90% = train, last 10% = val
+        split_idx = int(total * 0.9)
+        if self.split == "train":
+            manifest = manifest[:split_idx]
+        else:  # val
+            manifest = manifest[split_idx:]
+        
+        # Apply max_samples limit
+        if self.max_samples is not None:
+            manifest = manifest[:self.max_samples]
+        
+        logger.info(f"Downloading {len(manifest)} WAV files for '{self.split}' split...")
+        
+        # Step 4: Download each WAV and load audio
+        loaded = 0
+        for idx, entry in enumerate(manifest):
+            try:
+                wav_path = hf_hub_download(
+                    repo_id="kyutai/DailyTalkContiguous",
+                    filename=entry["path"],
+                    repo_type="dataset",
+                )
+                
+                # Read stereo audio with soundfile
+                data, sr = sf.read(wav_path)  # shape: (samples, 2), sr: 44100
+                array = data.astype(np.float32)
+                
+                # Transpose to (channels, samples) = (2, N)
+                if array.ndim == 2:
+                    array = array.T  # (2, N)
+                else:
+                    # Mono — duplicate to stereo
+                    array = np.stack([array, array], axis=0)
+                
+                text_context = f"Spoken dialogue conversation {idx}, duration {entry['duration']:.1f}s"
+                
+                self.data_samples.append({
+                    "array": array,
+                    "sample_rate": sr,
+                    "text_context": text_context,
+                })
+                loaded += 1
+                
+                if loaded % 100 == 0:
+                    logger.info(f"  Loaded {loaded}/{len(manifest)} tracks...")
+                    
+            except Exception as e:
+                logger.warning(f"  Skipping track {entry['path']}: {e}")
+                continue
+        
+        logger.info(f"✅ Successfully loaded {loaded} REAL conversation tracks for '{self.split}' split.")
 
     def _load_mock_samples(self):
         """Generates mock stereo spoken conversations for offline local testing."""
@@ -220,6 +247,31 @@ class SpokenDialogueDataset(Dataset):
             aligned_agent[:min_len, :] = agent_mel[:min_len, :]
             agent_mel = aligned_agent
             
+        # Crop sequence length during training to prevent quadratic O(L^2) memory explosion
+        max_frames = 256
+        if T_frames > max_frames:
+            if self.split == "train":
+                # Pick a random starting frame
+                start_frame = np.random.randint(0, T_frames - max_frames)
+            else:
+                # Deterministic starting frame for validation
+                start_frame = 0
+            mel_input = mel_input[start_frame:start_frame + max_frames, :]
+            agent_mel = agent_mel[start_frame:start_frame + max_frames, :]
+            
+            # Slice left_channel and right_channel to match cropped frames for RMS target calculation
+            start_s = start_frame * self.config.audio.hop_length
+            end_s = start_s + max_frames * self.config.audio.hop_length + self.config.audio.win_length
+            left_channel = left_channel[start_s:end_s]
+            right_channel = right_channel[start_s:end_s]
+            T_frames = max_frames
+
+        target_audio_len = T_frames * self.config.audio.hop_length
+        agent_audio = right_channel[:target_audio_len].astype(np.float32)
+        if len(agent_audio) < target_audio_len:
+            agent_audio = np.pad(agent_audio, (0, target_audio_len - len(agent_audio)))
+        agent_audio = torch.from_numpy(agent_audio).unsqueeze(0)
+            
         # 3. Calculate target turn boundaries
         hop_samples = self.config.audio.hop_length
         win_samples = self.config.audio.win_length
@@ -243,6 +295,9 @@ class SpokenDialogueDataset(Dataset):
             
         l_active = np.array(left_energy) > 0.015
         r_active = np.array(right_energy) > 0.015
+        agent_active = torch.from_numpy(r_active.astype(np.float32)).unsqueeze(-1)
+        l_energy_np = np.array(left_energy, dtype=np.float32)
+        r_energy_np = np.array(right_energy, dtype=np.float32)
         
         for t in range(T_frames - 1):
             user_just_stopped = l_active[t] and not l_active[min(T_frames-1, t+1)]
@@ -255,6 +310,23 @@ class SpokenDialogueDataset(Dataset):
                 start_w = max(0, t - 5)
                 end_w = min(T_frames, t + 10)
                 turn_target[start_w:end_w, 0] = 1.0
+
+        overlap_ratio = float(np.mean(l_active & r_active)) if T_frames else 0.0
+        user_active_ratio = float(np.mean(l_active)) if T_frames else 0.0
+        agent_active_ratio = float(np.mean(r_active)) if T_frames else 0.0
+        prosody_features = torch.tensor(
+            [
+                float(l_energy_np.mean()),
+                float(l_energy_np.std()),
+                float(r_energy_np.mean()),
+                float(r_energy_np.std()),
+                user_active_ratio,
+                agent_active_ratio,
+                overlap_ratio,
+                float(turn_target.mean().item()),
+            ],
+            dtype=torch.float32,
+        )
 
         # 4. Create Masked Mel Spectrogram
         masked_mel = mel_input.clone()
@@ -278,7 +350,10 @@ class SpokenDialogueDataset(Dataset):
             "masked_mel": masked_mel,
             "mask_indices": mask_indices,
             "turn_target": turn_target,
+            "agent_active": agent_active,
             "agent_mel": agent_mel,
+            "agent_audio": agent_audio,
+            "prosody_features": prosody_features,
             "text_context": text_context,
             "semantic_target": semantic_target
         }
@@ -295,7 +370,10 @@ def pad_collate_fn(batch):
     padded_masked_mel = torch.zeros(batch_sz, max_len, n_mels)
     padded_masks = torch.zeros(batch_sz, max_len)
     padded_turn_targets = torch.zeros(batch_sz, max_len, 1)
+    padded_agent_active = torch.zeros(batch_sz, max_len, 1)
     padded_agent_mel = torch.zeros(batch_sz, max_len, n_mels)
+    padded_agent_audio = torch.zeros(batch_sz, 1, max_len * 160)
+    padded_prosody_features = torch.zeros(batch_sz, 8)
     padded_semantic_targets = torch.zeros(batch_sz, d_mem)
     padded_lengths = torch.zeros(batch_sz, dtype=torch.long)
     
@@ -309,7 +387,11 @@ def pad_collate_fn(batch):
         padded_masked_mel[i, :seq_len, :] = item["masked_mel"]
         padded_masks[i, :seq_len] = item["mask_indices"]
         padded_turn_targets[i, :seq_len, :] = item["turn_target"]
+        padded_agent_active[i, :seq_len, :] = item["agent_active"]
         padded_agent_mel[i, :seq_len, :] = item["agent_mel"]
+        audio_len = min(item["agent_audio"].size(-1), padded_agent_audio.size(-1))
+        padded_agent_audio[i, :, :audio_len] = item["agent_audio"][:, :audio_len]
+        padded_prosody_features[i] = item["prosody_features"]
         padded_semantic_targets[i] = item["semantic_target"]
         text_contexts.append(item["text_context"])
         
@@ -318,7 +400,10 @@ def pad_collate_fn(batch):
         "masked_mel": padded_masked_mel,
         "mask_indices": padded_masks,
         "turn_target": padded_turn_targets,
+        "agent_active": padded_agent_active,
         "agent_mel": padded_agent_mel,
+        "agent_audio": padded_agent_audio,
+        "prosody_features": padded_prosody_features,
         "semantic_target": padded_semantic_targets,
         "text_contexts": text_contexts,
         "lengths": padded_lengths

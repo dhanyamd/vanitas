@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
-import numpy as np
-import hashlib
 import logging
 
 from vanitas.model.config import VanitasModelConfig
 from vanitas.model.cognition.memory import VectorMemory
+from vanitas.model.cognition.text_embedding import lexical_text_embedding
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vanitas.model.cognition.retrieval")
@@ -31,29 +30,11 @@ class FactualRetriever(nn.Module):
         self._embedding_cache = {}
 
     def _deterministic_text_embedding(self, text: str) -> torch.Tensor:
-        """Deterministically encodes a text string into a float32 vector of size `memory_dim` using SHA-256.
-        Acts as a reliable, dependency-free text encoder fallback.
-        """
+        """Dependency-free lexical embedding for retrieved memory documents."""
         if text in self._embedding_cache:
             return self._embedding_cache[text]
-            
-        # Compute SHA-256 hash of document
-        hasher = hashlib.sha256(text.encode("utf-8"))
-        hash_bytes = hasher.digest()
-        
-        # Use hash bytes to seed a deterministic random generator
-        seed = int.from_bytes(hash_bytes[:4], byteorder="big")
-        rng = np.random.default_rng(seed)
-        
-        # Generate random normal vector
-        vector = rng.normal(0.0, 0.1, self.config.memory_dim).astype(np.float32)
-        
-        # Normalize vector
-        norm = np.linalg.norm(vector)
-        if norm > 0:
-            vector = vector / norm
-            
-        tensor_vec = torch.from_numpy(vector)
+
+        tensor_vec = lexical_text_embedding(text, embedding_dim=self.config.memory_dim)
         self._embedding_cache[text] = tensor_vec
         return tensor_vec
 

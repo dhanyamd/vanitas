@@ -130,7 +130,11 @@ class FullVanitasLoss(nn.Module):
                 turn_targets: torch.Tensor,         # (B, T, 1)
                 agent_mel: torch.Tensor,            # (B, T, mel_bins) (Agent target mel)
                 semantic_target: torch.Tensor,      # (B, D_memory) (Target semantic embedding)
-                lengths: torch.Tensor) -> dict:     # (B,) (actual sequence lengths)
+                lengths: torch.Tensor,              # (B,) (actual sequence lengths)
+                flow_target: torch.Tensor = None,
+                speak_targets: torch.Tensor = None,
+                agent_active_mask: torch.Tensor = None,
+                agent_audio: torch.Tensor = None) -> dict:
         """
         Computes the unified joint loss.
         """
@@ -153,16 +157,24 @@ class FullVanitasLoss(nn.Module):
         
         # 2. Gating Turn-Taking Classification Loss (Weighted BCE) - Fusion Gates
         think_gate_preds = model_outputs["think_gate"]
+        speak_gate_preds = model_outputs["speak_gate"]
+        if speak_targets is None:
+            speak_targets = turn_targets
         think_preds_clipped = torch.clamp(think_gate_preds, min=1e-6, max=1.0 - 1e-6)
+        speak_preds_clipped = torch.clamp(speak_gate_preds, min=1e-6, max=1.0 - 1e-6)
         pos_weight = self.gate_pos_weight
-        bce_loss_raw = - (
+        think_bce_loss_raw = - (
             pos_weight * turn_targets * torch.log(think_preds_clipped) + 
             (1.0 - turn_targets) * torch.log(1.0 - think_preds_clipped)
         )
+        speak_bce_loss_raw = - (
+            pos_weight * speak_targets * torch.log(speak_preds_clipped) + 
+            (1.0 - speak_targets) * torch.log(1.0 - speak_preds_clipped)
+        )
         gate_active_mask = seq_mask.unsqueeze(-1)
-        gate_loss_sum = (bce_loss_raw * gate_active_mask).sum()
+        gate_loss_sum = ((think_bce_loss_raw + speak_bce_loss_raw) * gate_active_mask).sum()
         total_gate_elements = gate_active_mask.sum()
-        gate_loss = gate_loss_sum / max(1.0, total_gate_elements.item())
+        gate_loss = gate_loss_sum / max(1.0, 2.0 * total_gate_elements.item())
         
         # 3. Cognition Context Alignment Loss (Symmetric CLIP InfoNCE) - Cognition Core
         # Pool cognition states at turn boundary frames (where turn_targets == 1)
@@ -178,6 +190,16 @@ class FullVanitasLoss(nn.Module):
         has_boundary = (sum_weight > 0).float() # (B, 1)
         pooled_rep = has_boundary * active_rep + (1.0 - has_boundary) * mean_rep # (B, D_cognition)
         
+        speech_memory_target = model_outputs.get("speech_memory_target")
+        if speech_memory_target is not None and speech_memory_target.shape[-1] == pooled_rep.shape[-1]:
+            # Speech-native memory is the main target. The lexical vector is a
+            # lightweight teacher/fallback that prevents the space from becoming
+            # purely acoustic when text metadata is available.
+            if semantic_target.shape[-1] == speech_memory_target.shape[-1]:
+                semantic_target = F.normalize(0.8 * speech_memory_target + 0.2 * semantic_target, p=2, dim=-1)
+            else:
+                semantic_target = speech_memory_target
+
         # Normalize representations to compute cosine similarities
         pooled_rep_norm = F.normalize(pooled_rep, p=2, dim=-1)
         semantic_target_norm = F.normalize(semantic_target, p=2, dim=-1)
@@ -190,30 +212,44 @@ class FullVanitasLoss(nn.Module):
         loss_targets = F.cross_entropy(similarity_matrix.t(), labels)
         cognition_loss = (loss_queries + loss_targets) / 2.0
         
-        # 4. Production Continuous Flow Matching Loss (MSE on predicted vs target velocity) - Production Stream
+        # 4. Production Continuous Flow Matching Loss - Production Stream
         v_pred = model_outputs["v_pred"] # (B, T, mel_bins)
-        # Sample random noise y0: (B, T, mel_bins)
-        y0 = torch.randn_like(agent_mel)
-        v_target = agent_mel - y0 # Velocity field points directly from noise y0 to target agent_mel
-        
-        # Compute squared errors on velocity prediction, masking padding
-        flow_squared_err = (v_pred - v_target).pow(2)
-        flow_active_mask = seq_mask.unsqueeze(-1)
+        if flow_target is None:
+            flow_target = agent_mel
+        if agent_active_mask is None:
+            agent_active_mask = torch.ones(B_sz, T_sz, 1, device=device)
+
+        # Weight production toward real agent speech. Silence is still learned
+        # with a small weight, but cannot dominate the velocity field.
+        flow_squared_err = (v_pred - flow_target).pow(2)
+        flow_active_mask = seq_mask.unsqueeze(-1) * (0.1 + 0.9 * agent_active_mask)
         flow_loss_sum = (flow_squared_err * flow_active_mask).sum()
         total_flow_elements = flow_active_mask.sum() * self.mel_bins
         flow_loss = flow_loss_sum / max(1.0, total_flow_elements.item())
+
+        # 5. Trainable vocoder waveform reconstruction loss.
+        vocoder_audio = model_outputs.get("vocoder_audio")
+        if vocoder_audio is not None and agent_audio is not None:
+            min_samples = min(vocoder_audio.shape[-1], agent_audio.shape[-1])
+            pred_audio = vocoder_audio[..., :min_samples]
+            target_audio = agent_audio[..., :min_samples]
+            vocoder_loss = F.l1_loss(pred_audio, target_audio)
+        else:
+            vocoder_loss = torch.zeros((), device=device)
         
-        # 5. Joint Loss Weighted Combination
+        # 6. Joint Loss Weighted Combination
         lambda_mel = 1.0
         lambda_gate = 2.0
         lambda_cognition = 1.0
         lambda_flow = 1.0
+        lambda_vocoder = 0.25
         
         total_loss = (
             lambda_mel * mel_loss + 
             lambda_gate * gate_loss + 
             lambda_cognition * cognition_loss + 
-            lambda_flow * flow_loss
+            lambda_flow * flow_loss +
+            lambda_vocoder * vocoder_loss
         )
         
         return {
@@ -221,6 +257,6 @@ class FullVanitasLoss(nn.Module):
             "mel_loss": mel_loss,
             "gate_loss": gate_loss,
             "cognition_loss": cognition_loss,
-            "flow_loss": flow_loss
+            "flow_loss": flow_loss,
+            "vocoder_loss": vocoder_loss,
         }
-
