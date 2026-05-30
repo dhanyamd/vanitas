@@ -1,0 +1,149 @@
+"""Vanitas-SLM v2 — Modal entrypoint for cloud training.
+
+Usage (Stage 1, full):
+    modal run --detach train_modal_v2.py::stage1
+
+Usage (Stage 1, smoke test on a small instance first):
+    modal run train_modal_v2.py::stage1_smoke
+
+Stages 2-6 will be wired in as their training scripts land.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import modal
+
+
+# ---------------------------------------------------------------------------
+# Image — PyTorch CUDA base with Vanitas-SLM v2 dependencies
+# ---------------------------------------------------------------------------
+
+vanitas_v2_image = (
+    # Same PyTorch base train_modal.py uses; mamba-ssm and unsloth wheels exist for cu124.
+    modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel")
+    .apt_install("libsndfile1", "git", "build-essential")
+    .run_commands(
+        "pip install -q --upgrade pip wheel setuptools",
+        # Core deps
+        "pip install "
+        "'numpy>=1.26.0' "
+        "'scipy>=1.12.0' "
+        "'einops>=0.8.0' "
+        "'transformers>=4.45.0' "
+        "'datasets>=3.0.0' "
+        "'huggingface_hub>=0.20.0' "
+        "'accelerate>=0.30.0' "
+        "'bitsandbytes>=0.43.0' "
+        "'peft>=0.11.0' ",
+        # Mamba-2 official kernels (CUDA only; needs CUDA build during install)
+        "pip install --no-build-isolation 'mamba-ssm>=2.2.0' 'causal-conv1d>=1.4.0'",
+        # SNAC codec
+        "pip install snac",
+        # Unsloth for QLoRA acceleration. Pin to a recent version that supports Qwen3.
+        "pip install 'unsloth' 'unsloth_zoo'",
+    )
+    .add_local_dir(
+        str(Path(__file__).resolve().parent / "vanitas"),
+        remote_path="/root/vanitas",
+    )
+)
+
+
+app = modal.App(name="vanitas-slm-v2")
+
+# Persistent volumes that survive between runs.
+checkpoints_volume = modal.Volume.from_name("vanitas-slm-checkpoints", create_if_missing=True)
+hf_cache_volume = modal.Volume.from_name("vanitas-slm-hf-cache", create_if_missing=True)
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — full run
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=vanitas_v2_image,
+    gpu="A100",
+    timeout=6 * 3600,  # 6h cap; Stage 1 should finish well under this.
+    volumes={
+        "/root/checkpoints": checkpoints_volume,
+        "/root/.cache/huggingface": hf_cache_volume,
+    },
+)
+def stage1(
+    total_steps: int = 3000,
+    batch_size: int = 4,
+    grad_accum: int = 64,
+    seq_len: int = 2048,
+    lr: float = 5e-5,
+    warmup: int = 200,
+    eval_every: int = 500,
+):
+    """Stage 1 — Mamba surgery + distillation. PLAN.md §3 Stage 1."""
+    import os
+    import subprocess
+
+    sys.path.insert(0, "/root")
+    os.makedirs("/root/checkpoints/stage1", exist_ok=True)
+
+    cmd = [
+        "python", "-m", "vanitas.v2.training.stage1_mamba_distill",
+        "--total-steps", str(total_steps),
+        "--batch-size", str(batch_size),
+        "--grad-accum", str(grad_accum),
+        "--seq-len", str(seq_len),
+        "--lr", str(lr),
+        "--warmup", str(warmup),
+        "--eval-every", str(eval_every),
+        "--out-dir", "/root/checkpoints/stage1",
+    ]
+    print("⇒", " ".join(cmd))
+    result = subprocess.run(cmd, cwd="/root")
+    checkpoints_volume.commit()
+    hf_cache_volume.commit()
+    if result.returncode != 0:
+        raise SystemExit(f"Stage 1 exited with code {result.returncode}")
+
+
+@app.function(
+    image=vanitas_v2_image,
+    gpu="A10G",  # Smaller cheaper GPU is fine for the smoke pass.
+    timeout=30 * 60,
+    volumes={
+        "/root/checkpoints": checkpoints_volume,
+        "/root/.cache/huggingface": hf_cache_volume,
+    },
+)
+def stage1_smoke():
+    """5-step smoke test on a cheap GPU to confirm the pipeline runs end-to-end."""
+    import subprocess
+    sys.path.insert(0, "/root")
+    cmd = ["python", "-m", "vanitas.v2.training.stage1_mamba_distill", "--smoke",
+           "--out-dir", "/root/checkpoints/stage1_smoke"]
+    print("⇒", " ".join(cmd))
+    result = subprocess.run(cmd, cwd="/root")
+    checkpoints_volume.commit()
+    hf_cache_volume.commit()
+    if result.returncode != 0:
+        raise SystemExit(f"Stage 1 smoke exited with code {result.returncode}")
+
+
+# ---------------------------------------------------------------------------
+# Local entrypoints
+# ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def main():
+    """Default entrypoint: run the full Stage 1.
+
+    Suggested first invocation:
+        modal run train_modal_v2.py::stage1_smoke      (cheap, ~10 min)
+    Then:
+        modal run --detach train_modal_v2.py::stage1   (full, ~3-4 hrs)
+    """
+    print(
+        "Pick a function explicitly:\n"
+        "  modal run train_modal_v2.py::stage1_smoke\n"
+        "  modal run --detach train_modal_v2.py::stage1"
+    )
