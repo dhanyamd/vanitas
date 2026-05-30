@@ -71,10 +71,23 @@ class SurgeryReport:
 def load_base_qwen3(
     model_id: str = QWEN3_MODEL_ID,
     dtype: torch.dtype = torch.bfloat16,
-    device: str | torch.device = "cuda",
+    device: str | torch.device | None = None,
 ) -> nn.Module:
-    """Load Qwen3-1.7B unmodified, frozen, eval-mode. Used as the Stage-1 teacher."""
+    """Load Qwen3-1.7B unmodified, frozen, eval-mode. Used as the Stage-1 teacher.
+
+    Args:
+        device: target device. If ``None``, picks cuda → mps → cpu.
+                Passing a string ("cuda", "cpu") or a ``torch.device`` also works.
+    """
     from transformers import AutoModelForCausalLM
+
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
     model.to(device).eval()
@@ -103,6 +116,10 @@ def apply_mamba_surgery(
 
     Mutates ``model`` in place; does not return anything.
     """
+    if not positions:
+        # Nothing to do; explicit no-op rather than crashing on positions[0] below.
+        return
+
     if not mamba_available():
         raise RuntimeError(
             "Cannot apply Mamba surgery without CUDA mamba-ssm installed."
@@ -118,6 +135,10 @@ def apply_mamba_surgery(
         raise ValueError(
             f"Mamba positions out of range for a model with {n_layers} layers: {bad}"
         )
+
+    # Reject duplicates — replacing the same layer twice silently loses params.
+    if len(set(positions)) != len(positions):
+        raise ValueError(f"Duplicate Mamba positions are not allowed: {positions}")
 
     # Pick up the dtype / device of the original layer so the swap is seamless.
     template_param = next(layers[positions[0]].parameters())
@@ -210,6 +231,9 @@ def build_vanitas_backbone(
         total_params=total,
         trainable_params=trainable,
     )
+    # Print once so logs always include the model summary; callers don't have
+    # to remember to do this.
+    print(report.summary())
     return model, report
 
 

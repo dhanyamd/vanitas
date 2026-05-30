@@ -108,9 +108,14 @@ def evaluate_ppl(
     config_name: str | None = "wikitext-103-raw-v1",
     split: str = "validation",
 ) -> float:
-    """Token-level perplexity on a fixed slice of WikiText-103 validation."""
+    """Token-level perplexity on a fixed slice of WikiText-103 validation.
+
+    Restores the model's prior train/eval mode on exit, so callers that
+    invoke this on an eval-mode model don't get switched into train mode.
+    """
     from datasets import load_dataset
 
+    was_training = model.training
     model.eval()
     ds = load_dataset(dataset_name, config_name, split=split, streaming=True)
 
@@ -119,36 +124,39 @@ def evaluate_ppl(
     total_loss = 0.0
     total_tokens = 0
 
-    for sample in ds:
-        text = sample.get("text") or ""
-        if not text.strip():
-            continue
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        buf.extend(ids)
-        if eos is not None:
-            buf.append(eos)
+    try:
+        for sample in ds:
+            text = sample.get("text") or ""
+            if not text.strip():
+                continue
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            buf.extend(ids)
+            if eos is not None:
+                buf.append(eos)
 
-        while len(buf) >= seq_len:
-            seq = buf[:seq_len]
-            buf = buf[seq_len:]
-            x = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
-            logits = model(x).logits
-            # Standard next-token shift
-            loss = F.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)).float(),
-                x[:, 1:].reshape(-1),
-                reduction="sum",
-            )
-            total_loss += float(loss.item())
-            total_tokens += x.numel() - 1
-            if total_tokens >= max_eval_tokens:
-                model.train()
-                avg_nll = total_loss / total_tokens
-                return float(torch.tensor(avg_nll).exp().item())
+            while len(buf) >= seq_len:
+                seq = buf[:seq_len]
+                buf = buf[seq_len:]
+                x = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
+                logits = model(x).logits
+                # Standard next-token shift.
+                loss = F.cross_entropy(
+                    logits[:, :-1].reshape(-1, logits.size(-1)).float(),
+                    x[:, 1:].reshape(-1),
+                    reduction="sum",
+                )
+                total_loss += float(loss.item())
+                total_tokens += x.numel() - 1
+                if total_tokens >= max_eval_tokens:
+                    avg_nll = total_loss / total_tokens
+                    return float(torch.tensor(avg_nll).exp().item())
 
-    model.train()
-    avg_nll = total_loss / max(1, total_tokens)
-    return float(torch.tensor(avg_nll).exp().item())
+        avg_nll = total_loss / max(1, total_tokens)
+        return float(torch.tensor(avg_nll).exp().item())
+    finally:
+        # Restore caller's mode regardless of how we exited.
+        if was_training:
+            model.train()
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +200,13 @@ def train(args: argparse.Namespace) -> int:
     student.to(device)
     apply_mamba_surgery(student, positions=DEFAULT_MAMBA_POSITIONS)
     student.train()
-    student.gradient_checkpointing_enable()
+    # use_reentrant=False is required when some layers (embedding, frozen base
+    # Qwen3) have requires_grad=False while later layers (our Mamba blocks)
+    # have requires_grad=True. The reentrant variant breaks the autograd graph
+    # at the no-grad → grad boundary.
+    student.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
 
     # Freeze everything except the new Mamba blocks (and their layer-norm + gate).
     # The base Qwen3 weights should not move during Stage 1 — the entire job is
@@ -220,6 +234,8 @@ def train(args: argparse.Namespace) -> int:
     )
     loader = DataLoader(stream, batch_size=args.batch_size, num_workers=0)
     loader_iter = iter(loader)
+    loader_restarts = 0
+    MAX_LOADER_RESTARTS = 3  # If we restart this many times, the stream is broken.
 
     # ---- Training loop ---------------------------------------------------
     logger = StepLogger(log_every=args.log_every, stage="Stage1")
@@ -238,7 +254,19 @@ def train(args: argparse.Namespace) -> int:
             try:
                 batch = next(loader_iter)
             except StopIteration:
-                # Restart stream if we run out (shouldn't normally happen with max_tokens math above)
+                # We sized max_tokens to cover the full run; reaching here means
+                # the HF streaming dataset terminated early. Restart, but bail
+                # if it keeps happening (likely an upstream issue).
+                loader_restarts += 1
+                print(
+                    f"[Stage 1] WARNING: text stream exhausted at step {step}; "
+                    f"restarting (restart #{loader_restarts})."
+                )
+                if loader_restarts > MAX_LOADER_RESTARTS:
+                    raise RuntimeError(
+                        f"Text stream exhausted {loader_restarts} times; "
+                        "something is wrong with the dataset connection."
+                    )
                 loader_iter = iter(loader)
                 batch = next(loader_iter)
             batch = batch.to(device, non_blocking=True)

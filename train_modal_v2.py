@@ -135,15 +135,27 @@ def stage1_smoke():
 
 @app.local_entrypoint()
 def main():
-    """Default entrypoint: run the full Stage 1.
+    """Default entrypoint: prints recommended commands and exits.
 
-    Suggested first invocation:
-        modal run train_modal_v2.py::stage1_smoke      (cheap, ~10 min)
-    Then:
-        modal run --detach train_modal_v2.py::stage1   (full, ~3-4 hrs)
+    There is intentionally no default training run here. The smoke test costs
+    a couple of dollars; the full Stage 1 costs ~$80. We do not want to launch
+    either accidentally just because someone typed ``modal run train_modal_v2.py``.
+
+    Recommended sequence:
+        modal run train_modal_v2.py::stage1_smoke      (~$2, ~10 min)
+        modal run --detach train_modal_v2.py::stage1   (~$80, 3-4 hrs)
     """
     print(
-        "Pick a function explicitly:\n"
-        "  modal run train_modal_v2.py::stage1_smoke\n"
-        "  modal run --detach train_modal_v2.py::stage1"
+        "──────────────────────────────────────────────────────────────────\n"
+        "  Vanitas-SLM v2 — Modal entrypoint\n"
+        "──────────────────────────────────────────────────────────────────\n"
+        "  No default action. Pick one explicitly:\n\n"
+        "    modal run train_modal_v2.py::stage1_smoke\n"
+        "        Cheap (~$2) 5-step smoke test on an A10G. Confirms the\n"
+        "        whole pipeline runs end-to-end on CUDA before committing\n"
+        "        to the full Stage 1 spend.\n\n"
+        "    modal run --detach train_modal_v2.py::stage1\n"
+        "        Full Stage 1 on A100 (~$80, 3-4 hrs). --detach is\n"
+        "        recommended so the run survives terminal disconnects.\n"
+        "──────────────────────────────────────────────────────────────────"
     )
