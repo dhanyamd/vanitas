@@ -131,3 +131,7 @@ scratch/smoke_checkpoints/
 
 # Project data and databases
 data/
+
+# But DO track the v2 data-pipeline code (not the data files inside it).
+!vanitas/v2/data/
+!vanitas/v2/data/*.py
