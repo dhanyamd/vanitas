@@ -56,8 +56,8 @@ def check_snac(device: str) -> None:
         rate = c.shape[-1] / seconds
         print(f"[SNAC]   level {i}: shape={tuple(c.shape)}  approx_rate={rate:.1f} Hz")
 
-    # Sanity: SNAC's three levels should be at roughly 12 / 23 / 47 Hz.
-    expected_rates = [12, 23, 47]
+    # Sanity: SNAC's three levels should be at 12 / 24 / 48 Hz (verified).
+    expected_rates = [12, 24, 48]
     for i, (c, expected) in enumerate(zip(enc.codes, expected_rates)):
         actual = c.shape[-1] / seconds
         if abs(actual - expected) > expected * 0.25:
@@ -86,16 +86,16 @@ def check_qwen3(device: str) -> None:
     if device == "cpu":
         print("\n[Qwen3] Skipping LM check on CPU (it would be too slow to be informative).")
         return
-    print(f"\n[Qwen3] Loading Qwen/Qwen3-1.7B-Instruct on '{device}'...")
+    print(f"\n[Qwen3] Loading Qwen/Qwen3-1.7B on '{device}'...")
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise ImportError("transformers not installed. `pip install transformers`") from exc
 
     dtype = torch.float16 if device != "cpu" else torch.float32
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B-Instruct")
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-1.7B-Instruct", torch_dtype=dtype
+        "Qwen/Qwen3-1.7B", torch_dtype=dtype
     ).to(device).eval()
 
     n_params = sum(p.numel() for p in model.parameters())

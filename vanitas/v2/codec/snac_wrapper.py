@@ -1,7 +1,7 @@
 """SNAC codec wrapper.
 
 SNAC (Hubert Siuzdak, MIT) is a hierarchical RVQ neural audio codec at 24 kHz.
-It emits 3 resolution levels at ~12, 23, and 47 Hz. We use it frozen.
+It emits 3 resolution levels at 12, 24, and 48 Hz (verified by Stage 0). We use it frozen.
 
 Reference: https://github.com/hubertsiuzdak/snac
 """
@@ -23,8 +23,8 @@ class SnacOutput:
 
     ``codes`` is a list of 3 LongTensors with shapes:
       level0: (B, T_12hz)
-      level1: (B, T_23hz)   # ~2x level0
-      level2: (B, T_47hz)   # ~4x level0
+      level1: (B, T_24hz)   # 2x level0
+      level2: (B, T_48hz)   # 4x level0
     """
     codes: list[torch.Tensor]
 

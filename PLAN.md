@@ -28,7 +28,7 @@
 
 **S2. Mamba-into-Qwen3 surgery recipe.** Insert 4 Mamba-2 blocks at positions 6/13/20/27. Zero-init residual gates, distill back to base Qwen3 logits on 50M tokens. ≤5% PPL loss, linear-time inference scaling.
 
-**S3. Multi-stream LM format for SNAC hierarchical RVQ.** Delay pattern + interleaving for SNAC's 12/23/47 Hz hierarchy. Different from Moshi's flat-RVQ approach.
+**S3. Multi-stream LM format for SNAC hierarchical RVQ.** Delay pattern + interleaving for SNAC's 12/24/48 Hz hierarchy. Different from Moshi's flat-RVQ approach.
 
 ### Tier 2 — Valuable if they land
 
@@ -188,7 +188,7 @@ Mac mini M3 target (via GGUF/llama.cpp): ~220 ms simple, 420–720 ms thinking.
 
 ### Stage 1 — Mamba surgery + distillation (3 days, $80)
 
-1. Load Qwen3-1.7B-Instruct via Unsloth (4-bit QLoRA mode).
+1. Load Qwen3-1.7B via Unsloth (4-bit QLoRA mode).
 2. Expand tokenizer with ~6k SNAC tokens.
 3. Insert 4 Mamba-2 blocks at positions 6/13/20/27, zero-init residuals.
 4. Distill against frozen base Qwen3 logits on 50M tokens (OpenWebText subset).
