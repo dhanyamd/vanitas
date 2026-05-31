@@ -18,6 +18,24 @@
 - **Eight contributions** ranked by risk. S1–S6 are the safe paper. S7 (continual learning) and S8 (Moshi-gap distillation) are the ambitious bets that elevate the paper if they land. Plan survives if either or both fail.
 - **Decision gate at end of week 6** decides which big bet(s) get full effort.
 
+### Out of scope (intentionally — do not re-add)
+
+These were considered and explicitly rejected. Reasons logged here so a future
+self doesn't litigate them again mid-run.
+
+- **DPO / RLHF / GRPO / PPO** — no preference optimization, no reward modeling,
+  no policy-gradient stages. Reasons: (1) Qwen3-1.7B is already DPO'd at scale
+  by Alibaba; we inherit that alignment through the frozen base + LoRA.
+  (2) Comparable sub-2B speech LMs (Mini-Omni, LLaMA-Omni, CSM) ship without
+  it. (3) Our quality bottleneck at this scale is capability, not style, and
+  DPO fixes style; it can't make a small model smarter. (4) Cost / week of
+  timeline is better spent on more synthetic data (Stage 3 → 60h) or more
+  S8 distillation traces.
+- **Reward model training** — same reasons.
+- **Multilingual** — paper claim is English-only, single assistant voice.
+  Future work, not this paper.
+- **Tool use / function calling** — not the scope of a speech-LM paper.
+
 ---
 
 ## 1. Contribution Inventory
