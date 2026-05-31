@@ -14,10 +14,11 @@ Design choices and why:
   * **RMSNorm before Mamba.** Qwen3's blocks use RMSNorm, so we match it.
 
   * **HF transformer-block interface.** ``forward(hidden_states, **kwargs)``
-    returns a 1-tuple of ``(hidden_states,)``. This matches the shape that
-    Qwen3DecoderLayer.forward returns when ``output_attentions=False`` and
-    ``use_cache=False`` — which is the only mode we use during Stage 1
-    distillation. Cache support for streaming inference is added in Stage 6.
+    returns a single tensor ``hidden_states``. Modern Qwen3DecoderLayer
+    returns a tensor (not a tuple) — Qwen3Model.forward does
+    ``hidden_states = decoder_layer(hidden_states, ...)``. Returning a
+    tuple here crashes the next layer's input_layernorm with
+    ``'tuple' object has no attribute 'dtype'``.
 
   * **CUDA only at runtime.** ``mamba-ssm`` ships CUDA kernels only. On Mac
     or CPU, importing this file works but instantiating the block raises a
@@ -126,27 +127,20 @@ class Mamba2ResidualBlock(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.Tensor] = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor:
         """Run a Mamba-2 residual step.
 
         Most kwargs are accepted for HF-decoder-layer compatibility but
         ignored — SSMs don't use attention masks or position ids.
+
+        Returns a single tensor (not a tuple). This matches modern HF
+        Qwen3DecoderLayer, which is invoked as
+        ``hidden_states = decoder_layer(hidden_states, ...)``.
         """
         residual = hidden_states
         x = self.norm(hidden_states)
         x = self.mamba(x)
-        out = residual + self.gate * x
-
-        # HF Qwen3DecoderLayer.forward returns:
-        #   (hidden_states, [self_attn_weights], [present_key_value])
-        # We only ever return the first element since we never produce
-        # attentions or KV cache from a Mamba block.
-        outputs: tuple[torch.Tensor, ...] = (out,)
-        if output_attentions:
-            outputs = outputs + (None,)  # type: ignore[arg-type]
-        if use_cache:
-            outputs = outputs + (None,)  # type: ignore[arg-type]
-        return outputs
+        return residual + self.gate * x
 
 
 # ---------------------------------------------------------------------------
