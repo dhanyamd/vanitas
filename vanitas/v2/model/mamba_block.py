@@ -99,6 +99,11 @@ class Mamba2ResidualBlock(nn.Module):
 
         self.d_model = d_model
         self.layer_idx = layer_idx
+        # Qwen3Model.forward looks up causal_mask_mapping[layer.attention_type]
+        # BEFORE calling each layer. We need to carry an attribute it accepts
+        # ("full_attention" or "sliding_attention"). We pick "full_attention" so
+        # Qwen3 builds a standard causal mask, then ignore it inside our forward.
+        self.attention_type = "full_attention"
         self.norm = RMSNorm(d_model)
         # The official Mamba-2 block already projects back to d_model internally.
         self.mamba = _OfficialMamba2(  # type: ignore[misc]
