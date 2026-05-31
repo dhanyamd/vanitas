@@ -1,40 +1,39 @@
-# Vanitas-SLM — Final Plan (Locked, Ambitious Edition)
+# Vanitas-SLM — Final Plan (Path B — Trimmed Scope)
 
-> **Title:** Vanitas-SLM: An Edge-Deployable 1.8B Full-Duplex Speech Language Model with Adaptive Reasoning, On-Device Personalization, and Distillation-Closed Quality Gap
-> **Status:** Locked design with two ambitious bets (B + E). May 2026.
+> **Title:** Vanitas-SLM: An Edge-Deployable 1.85B Full-Duplex Speech Language Model via Mamba-Adapted Qwen3 and SNAC Hierarchical RVQ
+> **Status:** Path B locked. Moonshots S5/S6/S7/S8 dropped. May 2026.
 > **Authors:** dhanyamd + collaborator
-> **Budget:** $380 floor (with Kaggle/Colab/Modal credits stacked) — $725 ceiling
-> **Timeline:** 9 weeks
-> **Venue target:** Interspeech 2026 → ASRU 2026 → EMNLP 2026 → NeurIPS 2026 (in that order)
+> **Budget:** $250 floor — $450 ceiling
+> **Timeline:** 3–4 weeks (down from 9)
+> **Venue target:** Interspeech 2026 → ASRU 2026 workshop track
+
+> **Why trimmed:** The original plan stacked three high-risk research bets
+> (cognition gate, continual learning, big-teacher distillation) on top of a
+> core that already required 4 weeks. The risk-budget didn't fit the
+> timeline-budget. Path B keeps only the contributions that are (a) already
+> implemented or trivial to implement and (b) validated to work — Stage 1
+> smoke passed with PPL ratio 1.000. The moonshots are out of scope for
+> this paper; future work for v2.
 
 ---
 
-## 0. Scope decisions (locked)
+## 0. Scope decisions (locked, Path B)
 
-- **Small** — total inference params ~1.8B. INT4 GGUF deploys in ~1 GB.
+- **Small** — total inference params ~1.85B. INT4 GGUF deploys in ~1.1 GB.
 - **Pretrained components accepted as infrastructure** — Qwen3-1.7B (Apache-2) and SNAC (MIT). Cited, not claimed.
 - **Full duplex non-negotiable** — true parallel user+agent streams.
-- **Sub-200 ms TTFA non-negotiable** — target 180 ms on RTX 4090, 220 ms on Mac mini M3.
-- **Eight contributions** ranked by risk. S1–S6 are the safe paper. S7 (continual learning) and S8 (Moshi-gap distillation) are the ambitious bets that elevate the paper if they land. Plan survives if either or both fail.
-- **Decision gate at end of week 6** decides which big bet(s) get full effort.
+- **Sub-200 ms TTFA target** — 180 ms on RTX 4090, 220 ms on Mac mini M3. Higher is acceptable as long as ≤300 ms.
+- **Four contributions** (S1–S4). All low-risk; one (S2) already validated by Stage 1 smoke.
+- **No big-bet research moonshots.** S5–S8 are explicitly future work.
 
 ### Out of scope (intentionally — do not re-add)
 
-These were considered and explicitly rejected. Reasons logged here so a future
-self doesn't litigate them again mid-run.
-
-- **DPO / RLHF / GRPO / PPO** — no preference optimization, no reward modeling,
-  no policy-gradient stages. Reasons: (1) Qwen3-1.7B is already DPO'd at scale
-  by Alibaba; we inherit that alignment through the frozen base + LoRA.
-  (2) Comparable sub-2B speech LMs (Mini-Omni, LLaMA-Omni, CSM) ship without
-  it. (3) Our quality bottleneck at this scale is capability, not style, and
-  DPO fixes style; it can't make a small model smarter. (4) Cost / week of
-  timeline is better spent on more synthetic data (Stage 3 → 60h) or more
-  S8 distillation traces.
-- **Reward model training** — same reasons.
-- **Multilingual** — paper claim is English-only, single assistant voice.
-  Future work, not this paper.
-- **Tool use / function calling** — not the scope of a speech-LM paper.
+- **DPO / RLHF / GRPO / PPO** — Qwen3-1.7B is already DPO'd by Alibaba; we inherit it via frozen base + LoRA. Comparable papers (Mini-Omni, LLaMA-Omni, CSM) all ship without preference optimization.
+- **Adaptive cognition gate (was S6)** — high-risk research bet, dropped to fit timeline. Future work.
+- **On-device continual learning (was S7)** — high-risk research bet, dropped. Future work.
+- **Two-teacher distillation moonshot (was S8)** — high-risk research bet, dropped. The base Qwen3 quality is enough for the paper claim we're now making.
+- **Constrained multi-stream decoding (was S5)** — drop from contributions; if we need it for inference correctness we add a 50-line custom logit processor without claiming novelty.
+- **Reward model training, multilingual, tool use** — not the scope of this paper.
 
 ---
 
@@ -48,27 +47,16 @@ self doesn't litigate them again mid-run.
 
 **S3. Multi-stream LM format for SNAC hierarchical RVQ.** Delay pattern + interleaving for SNAC's 12/24/48 Hz hierarchy. Different from Moshi's flat-RVQ approach.
 
-### Tier 2 — Valuable if they land
+### Tier 2 — Valuable, low-risk
 
 **S4. Resolution-aware depth decoder.** 2-layer Transformer, ~12M params, predicts all 3 SNAC resolutions per step with cross-resolution attention.
 
-**S5. Constrained multi-stream decoding.** Logit-processor layer guaranteeing valid token streams + delay-pattern correctness.
+### Dropped from this paper (was S5, S6, S7, S8 — see §0 "out of scope")
 
-### Tier 3 — Medium risk
-
-**S6. Adaptive reasoning routing via Qwen3 /think.** Gate learns *when* to invoke Qwen3's native reasoning mode during streaming speech. Lower risk than the original from-scratch cognition-gate design because the reasoning capability is inherited from Qwen3 pretraining.
-
-### Tier 4 — Big bet (B)
-
-**S7. On-device continual personalization with catastrophic-forgetting prevention.** First speech LM that adapts to the user during deployment without losing general capability. Personal LoRA (rank-8) updated via online fine-tuning + EWC regularization + replay buffer. Hot-swappable / exportable. Eval introduces new metrics for online speech-LM adaptation.
-
-### Tier 5 — Moonshot (E)
-
-**S8. Distillation recipe closing the Moshi-7B quality gap at 25% of the size.** Two-teacher distillation:
-- Qwen3-32B for text reasoning quality (cheap, via OpenRouter)
-- Moshi-7B for STS-specific behaviors (if compute available)
-
-Plus extended synthetic corpus (30h → 150h) for better dialogue coverage. Claim: "75–85% of Moshi quality at 25% of params, trained for $200." If it lands, this is the most cited result in the paper.
+- ~~Constrained multi-stream decoding (S5)~~ → if needed for inference correctness, do as 50-line logit mask, don't claim novelty.
+- ~~Adaptive reasoning routing via Qwen3 /think (S6)~~ → future work.
+- ~~On-device continual personalization (S7)~~ → future work.
+- ~~Two-teacher distillation moonshot (S8)~~ → future work.
 
 ---
 
@@ -87,14 +75,11 @@ Plus extended synthetic corpus (30h → 150h) for better dialogue coverage. Clai
   + 4 Mamba-2 layers (S2)             ~120M      yours       yes
   + Audio-token embeddings            ~8M        yours       yes
   + Resolution-aware depth dec (S4)   ~12M       yours       yes
-  + Logit-constraint module (S5)      ~0M        rule        no
-  + Reasoning-routing gate (S6)       ~1M        yours       yes
-  + General LoRA on Qwen3 (rank-32)   ~20M       yours       yes
-  + Personal LoRA (rank-8, per-user)  ~5M        yours       online
+  + LoRA on Qwen3 (rank-32)           ~20M       yours       yes
 ─────────────────────────────────────────────────────────────────
-  Total inference params              ~1.89B
-  Total trainable params              ~166M
-  INT4 deployment size                ~1.0 GB
+  Total inference params              ~1.85B
+  Total trainable params              ~160M
+  INT4 deployment size                ~1.1 GB
 ─────────────────────────────────────────────────────────────────
 ```
 
@@ -204,17 +189,16 @@ Mac mini M3 target (via GGUF/llama.cpp): ~220 ms simple, 420–720 ms thinking.
 
 ---
 
-## 3. Training Curriculum — 9 Stages (with B+E additions)
+## 3. Training Curriculum — 5 Stages (Path B)
 
-### Stage 1 — Mamba surgery + distillation (3 days, $80)
+### Stage 1 — Mamba surgery + distillation (3–4 days, $80) ✅ smoke validated
 
-1. Load Qwen3-1.7B via Unsloth (4-bit QLoRA mode).
-2. Expand tokenizer with ~6k SNAC tokens.
-3. Insert 4 Mamba-2 blocks at positions 6/13/20/27, zero-init residuals.
-4. Distill against frozen base Qwen3 logits on 50M tokens (OpenWebText subset).
-5. AdamW, LR 5e-5, cosine, batch 16, grad accum to 256.
+1. Load Qwen3-1.7B via HF transformers (bf16).
+2. Insert 4 Mamba-2 blocks *after* layers 6/13/20/27 (32-layer stack with zero-init residual gates).
+3. Distill against frozen base Qwen3 logits on 50M tokens (OpenWebText subset).
+4. AdamW, LR 5e-5, cosine, batch 4, grad accum to 64 (effective batch 256).
 
-**Exit:** WikiText-103 PPL within 5% of base Qwen3-1.7B.
+**Exit:** WikiText-103 PPL within 5% of base Qwen3-1.7B. Smoke run already confirmed ratio = 1.000 at step 0.
 
 ### Stage 2 — SNAC token alignment (3 days, $80)
 
@@ -245,70 +229,7 @@ Mac mini M3 target (via GGUF/llama.cpp): ~220 ms simple, 420–720 ms thinking.
 
 **Exit:** Generated-speech WER ≤ 25%, UTMOS ≥ 3.2, RTF ≤ 1.0.
 
-### 🎯 **Week 6 Decision Gate**
-
-After Stage 4 completion, evaluate base quality and decide big-bet path:
-
-| Stage 4 Quality | Recommended path | Why |
-|---|---|---|
-| WER ≤ 20% AND UTMOS ≥ 3.4 (strong base) | **Commit to S7 (B)** — base is good enough that personalization will be impressive | continual learning on a strong base demonstrates the recipe |
-| WER 20–25% OR UTMOS 3.2–3.4 (acceptable) | **Pursue S8 (E)** distillation to lift quality first, then S7 if time | weak base + personalization = unimpressive demo |
-| WER > 25% OR UTMOS < 3.2 (below threshold) | **Drop both big bets** — ship S1–S6 only | base needs more work; ambition won't save it |
-
-### Stage 4.5 (B-track) — Continual learning infrastructure (4 days, $30)
-
-Only run if committing to S7.
-
-1. Build "synthetic user" benchmark: 50 simulated users with distinct vocabulary preferences + voice characteristics (synth speaker IDs).
-2. Implement personal-LoRA hot-swap and online update mechanism.
-3. Implement EWC computation: Fisher info for general LoRA computed once after Stage 4.
-4. Implement replay buffer + general-task held-out eval.
-
-**Exit:** Infrastructure runs end-to-end on a single sample user without crashing. No quality target yet.
-
-### Stage 4.6 (E-track) — Teacher distillation (5 days, $50)
-
-Only run if committing to S8.
-
-1. Run Qwen3-32B on 10k reasoning prompts via OpenRouter (~$30) → collect logits/responses.
-2. *Optional, if budget allows:* run Moshi-7B on 5k STS prompts via rented A100 ($20) → collect codec streams.
-3. Add distillation loss to Stage 4 training: KL(student || Qwen3-32B teacher) for text, audio-token NLL matching for Moshi-trace (if available).
-4. Continue training for ~2 days with the combined loss.
-
-**Exit:** Reasoning eval (GSM8K-spoken or MMLU-spoken proxy) improves ≥ 5 pts over Stage 4 baseline.
-
-### Stage 4.7 (E-track) — Extended synthetic corpus (4 days, $60)
-
-Only run if committing to S8.
-
-1. Generate additional 120h of synthetic dialogue (total now 150h) covering more topics: reasoning, multi-turn, longer contexts.
-2. Continue Stage 4 training on combined 150h with distillation loss active.
-
-**Exit:** Generated WER ≤ 18% (significant lift from 25%).
-
-### Stage 5 — Reasoning routing gate fine-tune (2 days, $30)
-
-1. **5a (supervised):** Re-generate 5h of corpus with explicit `/think` mode labels on reasoning-heavy turns. Train gate with frame-level BCE.
-2. **5b (semi-supervised):** Drop labels, add sparsity KL + hard-concrete + temperature annealing.
-3. At inference, when `p_think > τ`, prepend `/think` to next assistant turn.
-
-**Exit:** Firing rate ∈ [3%, 25%] AND reasoning subset accuracy uplift ≥ 2 pts. Failure path: drop gate, paper unaffected.
-
-### Stage 5.5 (B-track) — Online personalization training + eval (1 week, $40)
-
-Only run if committing to S7.
-
-1. For each of 50 simulated users:
-   - 20 sessions of interaction
-   - Personal LoRA updated after each session via online fine-tune + EWC
-2. Track two curves:
-   - **Personalization:** task-specific accuracy on user's vocabulary/style over sessions
-   - **Forgetting:** general-task quality on held-out benchmark
-3. Report uplift on user-specific metrics + preservation of general capability.
-
-**Exit:** ≥10% improvement on personal tasks averaged across 50 users WITH ≤2 pt drop on general benchmarks.
-
-### Stage 6 — Eval + latency optimization + GGUF (3 days, $40)
+### Stage 5 — Eval + latency optimization + GGUF (3 days, $40)
 
 - INT4 quantization (Unsloth dynamic)
 - `torch.compile` + Flash-Attn 2
@@ -320,7 +241,7 @@ Only run if committing to S7.
 
 ---
 
-## Budget Summary (Final)
+## Budget Summary (Path B)
 
 | Stage | Cost |
 |---|---|
@@ -328,16 +249,13 @@ Only run if committing to S7.
 | 2. SNAC alignment | $80 |
 | 3. Synthetic data gen | $15 |
 | 4. Duplex SFT | $100 |
-| **4.5. Continual-learning infra (B)** | **$30** |
-| **4.6. Teacher distillation (E)** | **$50** |
-| **4.7. Extended corpus (E)** | **$60** |
-| 5. Reasoning routing gate | $30 |
-| **5.5. Online personalization (B)** | **$40** |
-| 6. Eval + optimization | $40 |
-| **Subtotal (all stages)** | **$525** |
-| Buffer (2× re-runs) | $200 |
-| **Realistic ceiling** | **$725** |
-| Cash floor (with free tiers stacked) | **~$380** |
+| 5. Eval + optimization + GGUF | $40 |
+| **Subtotal** | **$315** |
+| Buffer (failed re-runs) | $130 |
+| **Realistic ceiling** | **$450** |
+| Cash floor (with Kaggle/Colab credits) | **~$250** |
+
+Smoke spend to date: $0.63. Counts against ceiling.
 
 ---
 
