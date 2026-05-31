@@ -21,29 +21,34 @@ import modal
 # ---------------------------------------------------------------------------
 
 vanitas_v2_image = (
-    # Same PyTorch base train_modal.py uses; mamba-ssm and unsloth wheels exist for cu124.
+    # PyTorch 2.4 / CUDA 12.4 base. We deliberately do NOT install unsloth here
+    # because its torch>=2.4,<2.11 resolver will upgrade torch to 2.10 and
+    # break torchvision's C++ ops binding (torchvision::nms missing). For QLoRA
+    # in stages 2+ we use plain peft + bitsandbytes, which is slower than
+    # unsloth's fused kernels but doesn't require a torch version bump.
     modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel")
     .apt_install("libsndfile1", "git", "build-essential")
     .run_commands(
         "pip install -q --upgrade pip wheel setuptools",
-        # Core deps
+        # Core deps. transformers pinned to 4.x because the 5.x line ships
+        # behavioural changes we haven't verified against our HF-layer code.
         "pip install "
         "'numpy>=1.26.0' "
         "'scipy>=1.12.0' "
         "'einops>=0.8.0' "
-        "'transformers>=4.45.0' "
+        "'transformers>=4.45.0,<5.0' "
         "'datasets>=3.0.0' "
-        "'huggingface_hub>=0.20.0' "
+        "'huggingface_hub[hf_transfer]>=0.20.0' "
         "'accelerate>=0.30.0' "
         "'bitsandbytes>=0.43.0' "
         "'peft>=0.11.0' ",
-        # Mamba-2 official kernels (CUDA only; needs CUDA build during install)
+        # Mamba-2 official kernels. --no-build-isolation lets it find the
+        # already-installed torch from the base image instead of pulling a new one.
         "pip install --no-build-isolation 'mamba-ssm>=2.2.0' 'causal-conv1d>=1.4.0'",
-        # SNAC codec
+        # SNAC codec.
         "pip install snac",
-        # Unsloth for QLoRA acceleration. Pin to a recent version that supports Qwen3.
-        "pip install 'unsloth' 'unsloth_zoo'",
     )
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     .add_local_dir(
         str(Path(__file__).resolve().parent / "vanitas"),
         remote_path="/root/vanitas",

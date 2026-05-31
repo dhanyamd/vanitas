@@ -89,7 +89,12 @@ def load_base_qwen3(
         else:
             device = "cpu"
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
+    # HF transformers ≥ 4.45 renames the kwarg `torch_dtype` → `dtype`;
+    # we try the new name first and fall back for older installs.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
     model.to(device).eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -202,7 +207,10 @@ def build_vanitas_backbone(
     n_layers = base_cfg.num_hidden_layers
     base_vocab_size = base_cfg.vocab_size
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype).to(device)
     model.train()
 
     apply_mamba_surgery(

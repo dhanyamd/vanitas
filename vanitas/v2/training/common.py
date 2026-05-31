@@ -61,7 +61,10 @@ def load_qwen3_for_training(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
     return model, tokenizer
 
 
