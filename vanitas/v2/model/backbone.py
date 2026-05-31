@@ -112,17 +112,27 @@ def apply_mamba_surgery(
     d_conv: int = 4,
     expand: int = 2,
 ) -> None:
-    """Replace the listed decoder layers in-place with Mamba-2 residual blocks.
+    """Insert Mamba-2 residual blocks *after* the listed Qwen3 decoder layers.
 
-    The Qwen3 layer list is accessed at ``model.model.layers``. Each entry
-    is a ``Qwen3DecoderLayer``; we replace it with a :class:`Mamba2ResidualBlock`
-    of matching width. Because the new block uses a zero-init residual gate,
-    forward behaviour is identical to the unmodified model at step 0.
+    Note this is INSERT, not REPLACE. The original Qwen3 layers are all
+    preserved; we add 4 new Mamba blocks in between them. With the Mamba
+    block's gate initialized to zero, each new block is the identity
+    function at step 0, so the student is bitwise-equivalent to the
+    unmodified base model. Distillation then opens the gates to let the
+    Mamba blocks contribute.
+
+    Earlier versions of this function replaced layers, which dropped 4 of
+    Qwen3's 28 attention/FFN blocks and roughly doubled PPL at init —
+    distillation could in principle recover, but it's much cleaner to
+    start at teacher quality and learn upward from there.
+
+    Example with positions=(6, 13, 20, 27) on the 28-layer Qwen3-1.7B
+    stack produces a 32-layer model with Mamba blocks at indices
+    7, 15, 23, 31 (immediately after each requested position).
 
     Mutates ``model`` in place; does not return anything.
     """
     if not positions:
-        # Nothing to do; explicit no-op rather than crashing on positions[0] below.
         return
 
     if not mamba_available():
@@ -138,27 +148,35 @@ def apply_mamba_surgery(
     bad = [p for p in positions if not 0 <= p < n_layers]
     if bad:
         raise ValueError(
-            f"Mamba positions out of range for a model with {n_layers} layers: {bad}"
+            f"Insert-after positions out of range for {n_layers}-layer model: {bad}"
         )
 
-    # Reject duplicates — replacing the same layer twice silently loses params.
     if len(set(positions)) != len(positions):
         raise ValueError(f"Duplicate Mamba positions are not allowed: {positions}")
 
-    # Pick up the dtype / device of the original layer so the swap is seamless.
+    # Match the original layers' dtype / device on the new blocks.
     template_param = next(layers[positions[0]].parameters())
     dtype = template_param.dtype
     device = template_param.device
 
-    for pos in positions:
-        new_block = Mamba2ResidualBlock(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            layer_idx=pos,
-        ).to(device=device, dtype=dtype)
-        layers[pos] = new_block
+    insert_after = set(positions)
+
+    new_layers: list[nn.Module] = []
+    for i, layer in enumerate(layers):
+        new_layers.append(layer)
+        if i in insert_after:
+            mamba_block = Mamba2ResidualBlock(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+                layer_idx=len(new_layers),  # position in the new list
+            ).to(device=device, dtype=dtype)
+            new_layers.append(mamba_block)
+
+    model.model.layers = nn.ModuleList(new_layers)  # type: ignore[attr-defined]
+    # Update the model config so HF's loops and KV-cache logic see the right depth.
+    model.config.num_hidden_layers = len(new_layers)
 
 
 def resize_for_expanded_vocab(
@@ -252,18 +270,29 @@ def build_vanitas_backbone(
 def dryrun_layer_map(model_id: str = QWEN3_MODEL_ID) -> None:
     """Print the layer map without instantiating Mamba.
 
+    Reflects INSERT semantics: Mamba blocks are inserted immediately after
+    each of ``DEFAULT_MAMBA_POSITIONS``, growing the stack by 4 layers.
+
     Useful on Mac to confirm positions / counts before sending a CUDA job.
     """
     from transformers import AutoConfig
 
     cfg = AutoConfig.from_pretrained(model_id)
     n_layers = cfg.num_hidden_layers
-    positions = set(DEFAULT_MAMBA_POSITIONS)
+    insert_after = set(DEFAULT_MAMBA_POSITIONS)
 
-    print(f"Model: {model_id}  ({n_layers} layers, hidden={cfg.hidden_size})")
+    new_total = n_layers + len(insert_after)
+    print(
+        f"Model: {model_id}  ({n_layers} base layers → {new_total} after "
+        f"INSERT, hidden={cfg.hidden_size})"
+    )
+    new_idx = 0
     for i in range(n_layers):
-        tag = "[Mamba-2]" if i in positions else "          "
-        print(f"  L{i:>2}  {tag}")
+        print(f"  new L{new_idx:>2}  ← Qwen3 L{i}")
+        new_idx += 1
+        if i in insert_after:
+            print(f"  new L{new_idx:>2}  [Mamba-2 inserted after Qwen3 L{i}]")
+            new_idx += 1
 
 
 if __name__ == "__main__":

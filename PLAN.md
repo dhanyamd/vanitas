@@ -44,7 +44,7 @@ self doesn't litigate them again mid-run.
 
 **S1. Smallest published edge-deployable full-duplex speech LM.** 1.8B, runs in <8GB at INT4, GGUF/llama.cpp on Mac. Comparison: Moshi 7B (data-center only), Mini-Omni ~1B (half-duplex), CSM 1B (TTS).
 
-**S2. Mamba-into-Qwen3 surgery recipe.** Insert 4 Mamba-2 blocks at positions 6/13/20/27. Zero-init residual gates, distill back to base Qwen3 logits on 50M tokens. ≤5% PPL loss, linear-time inference scaling.
+**S2. Mamba-into-Qwen3 surgery recipe.** Insert 4 Mamba-2 blocks *after* Qwen3 layers 6/13/20/27 (resulting 32-layer stack with Mamba at new indices 7/15/23/31). Zero-init residual gates ⇒ student ≡ teacher at step 0. Distill back to base Qwen3 logits on 50M tokens to open the gates. ≤5% PPL loss, linear-time inference scaling on the new Mamba layers.
 
 **S3. Multi-stream LM format for SNAC hierarchical RVQ.** Delay pattern + interleaving for SNAC's 12/24/48 Hz hierarchy. Different from Moshi's flat-RVQ approach.
 
@@ -101,16 +101,18 @@ Plus extended synthetic corpus (30h → 150h) for better dialogue coverage. Clai
 ### 2.2 Mamba surgery diagram
 
 ```
-Qwen3-1.7B has 28 transformer layers. We replace 4 of them:
+Qwen3-1.7B has 28 transformer layers. We INSERT 4 Mamba blocks after
+layers 6/13/20/27, growing the stack to 32 layers:
 
-  L0─L1─L2─L3─L4─L5─[M]─L7─L8─L9─L10─L11─L12─[M]─
-  L14─L15─L16─L17─L18─L19─[M]─L21─L22─L23─L24─L25─L26─[M]
+  L0─L1─...─L5─L6─[M]─L7─...─L12─L13─[M]─L14─...─L19─L20─[M]─L21─...─L26─L27─[M]
+                  ↑                ↑                ↑                       ↑
+              new L7            new L15           new L23                 new L31
 
   [M] = Mamba-2 block (d_model=2048, d_state=128, expand=2)
-       residual output projection zero-initialized
+        scalar residual gate initialized to zero
 
-  At training start: behavior ≡ Qwen3-1.7B
-  After Stage 1 distillation: SSM signal carried, base behavior preserved
+  At training start: gate=0 ⇒ Mamba block ≡ identity ⇒ student ≡ base Qwen3
+  After Stage 1 distillation: gates open, Mamba signal contributes
 ```
 
 ### 2.3 Multi-stream data flow

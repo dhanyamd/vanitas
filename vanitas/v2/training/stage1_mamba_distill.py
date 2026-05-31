@@ -208,17 +208,22 @@ def train(args: argparse.Namespace) -> int:
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    # Freeze everything except the new Mamba blocks (and their layer-norm + gate).
-    # The base Qwen3 weights should not move during Stage 1 — the entire job is
-    # to teach the SSM layers to play nice in-residual.
+    # Freeze everything, then unfreeze only the new Mamba blocks (norm + mamba
+    # kernel + scalar gate). We identify them by module class instead of by
+    # name-pattern — the previous f".layers.{pos}." check broke once we
+    # switched from REPLACE to INSERT semantics, because the Mamba blocks no
+    # longer sit at positions 6/13/20/27; they sit one slot after each.
+    from vanitas.v2.model.mamba_block import Mamba2ResidualBlock
+
+    for p in student.parameters():
+        p.requires_grad_(False)
+
     trainable_params: list[nn.Parameter] = []
-    for name, p in student.named_parameters():
-        is_mamba_layer = any(
-            f".layers.{pos}." in name for pos in DEFAULT_MAMBA_POSITIONS
-        )
-        p.requires_grad_(is_mamba_layer)
-        if is_mamba_layer:
-            trainable_params.append(p)
+    for module in student.modules():
+        if isinstance(module, Mamba2ResidualBlock):
+            for p in module.parameters(recurse=True):
+                p.requires_grad_(True)
+                trainable_params.append(p)
     n_train = sum(p.numel() for p in trainable_params)
     print(f"[Stage 1] Trainable Mamba params: {n_train:,} (~{n_train/1e6:.1f}M)")
 
