@@ -6,13 +6,48 @@
 
 ## One-sentence contribution
 
-**The first private, on-device speech-to-speech assistant that continually
-personalizes to its user across sessions — learning their facts, preferences,
-and speaking style — within an RL-optimized real-time latency budget on consumer
-hardware, without catastrophic forgetting.**
+**A real-time speech language model that thinks asynchronously — generating its
+response over *streaming* user input before the utterance completes, via an
+RL-trained commit/wait/revise policy — and continually learns its user at
+inference through external memory, with no backprop and no catastrophic
+forgetting.**
 
-Working title: *"Vanitas: RL-Optimized, Latency-Bounded Continual Personalization
-for Private On-Device Speech-to-Speech Assistants."*
+Working title (pick at submission from results):
+- *"Learning to Think Before You Speak: Reinforcement-Learned Asynchronous
+  Generation for Streaming Speech Language Models"*
+- *"Vanitas: RL-Trained Asynchronous Thinking with Continual Memory for
+  Real-Time Speech"*
+
+### Contribution structure (locked)
+
+- **Headline (C1) — Asynchronous Thinking.** Streaming speech generation that
+  starts responding before the user finishes, then revises as more audio
+  arrives. A new *capability* for speech LMs, directly cashing out the latency
+  goal (can reach ~zero / negative effective latency).
+- **Method for C1 — RL.** The core of async thinking is a sequential decision
+  under partial information: *commit / wait / revise*. Trained with RL (GRPO /
+  RLVR) on a verifiable reward = response quality − latency − revision cost.
+  This is *why RL is in the title* — it is the training method for the headline
+  capability, not a bolted-on extra.
+- **Contribution 2 (C2) — Continual learning at inference.** Memory-based,
+  non-parametric: the model writes experiences to an external memory and
+  retrieves at inference. No backprop, no catastrophic forgetting (weights
+  frozen). Under-explored for speech.
+- **Substrate — Compute-Memory Separation.** Small frozen Qwen3 (compute) +
+  growing external memory (knowledge). Enables C2.
+- **Motivation only (not a deliverable) — Evaluation ∝ GDP / dynamic test-time
+  eval.** North-star framing; too broad to operationalize in this paper.
+
+Maps to the project's four-pillar vision: async thinking = pillar 2, continual
+learning = pillar 4, compute-memory separation = pillar 1, GDP-eval = pillar 3
+(motivation only).
+
+### Scope discipline
+
+- **Must-ship:** the RL-trained asynchronous-thinking streaming model on the
+  working SLAM-Omni + Qwen3 + Mamba base. This alone is the paper.
+- **C2 (memory continual learning):** cheap; add once C1 works.
+- Base build is identical regardless of headline → proceeds now, zero waste.
 
 ## Why it's novel (pressure-tested against the literature)
 
