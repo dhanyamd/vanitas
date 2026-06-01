@@ -53,6 +53,24 @@ Working title (pick at submission from results):
   (2) persistence = per-user-across-sessions, not per-document; (3) no external
   ANN index; (4) memory feeds the async commit/wait/revise policy. Cite the
   inspiration, claim the speech + continual + async instantiation.
+
+  **Anti-rot design (HARD CONSTRAINT — never "store everything"):** unbounded
+  append causes quality rot (stale recalls), latency rot (slow top-k), and
+  memory rot (RAM/disk blowup → breaks edge). Therefore from day one:
+  - **Salience-gated writes:** only write turns that pass a salience test
+    (new fact / preference / correction). Trivial turns ("ok", "thanks") are
+    forgotten immediately — like humans.
+  - **Bounded store:** hard cap N entries → bounds recall latency and RAM.
+  - **Usefulness × recency eviction:** evict least-useful (old AND rarely
+    retrieved); keep frequently-recalled memories. Optional decay so memories
+    age out unless reinforced.
+  - **Consolidation (stretch):** periodically merge similar entries
+    (episodic → semantic summaries).
+
+  This turns C2 from "we added a buffer" into a real research question:
+  **what should a speech assistant remember vs forget to stay relevant AND
+  real-time across sessions?** The rot problem IS the novelty. On-theme with the
+  manifesto: forgetting the trivial is a feature, not a bug.
 - **Substrate — Compute-Memory Separation.** Small frozen Qwen3 (compute) +
   growing external memory (knowledge). Enables C2.
 - **Motivation only (not a deliverable) — Evaluation ∝ GDP / dynamic test-time
