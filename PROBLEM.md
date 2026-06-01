@@ -33,6 +33,26 @@ Working title (pick at submission from results):
   non-parametric: the model writes experiences to an external memory and
   retrieves at inference. No backprop, no catastrophic forgetting (weights
   frozen). Under-explored for speech.
+
+  **Concrete design (our own; inspired by, NOT copied from, Memorizing
+  Transformers, Wu et al. ICLR 2022, arXiv:2203.08913):**
+  - `VanitasKVMemory` module (~150 LOC we write): bounded tensors
+    `K_mem [N, n_kv_heads, head_dim]`, `V_mem [...]`.
+  - `write(k, v)`: `.detach()` + concat salient turn keys/values into the store;
+    evict oldest when full. **No backprop through writes** (matches pillar 4).
+  - `read(q)`: plain torch top-k cosine similarity (NOT Faiss/ANN — our store is
+    small enough; no external index, no service).
+  - Surgery hook: wrap ONE Qwen3 attention layer's forward to concatenate
+    retrieved memory K/V with local K/V before softmax — same style as the
+    validated Mamba surgery (wrap a layer, base frozen).
+  - Persistence: per-user store saved as a `.pt` file on device. No DB, no
+    Qdrant/Pinecone, **not RAG** (nothing stuffed into the text prompt; the model
+    attends to memory in latent KV space).
+
+  **Why it's ours, not a copy:** (1) domain = speech tokens (unstudied);
+  (2) persistence = per-user-across-sessions, not per-document; (3) no external
+  ANN index; (4) memory feeds the async commit/wait/revise policy. Cite the
+  inspiration, claim the speech + continual + async instantiation.
 - **Substrate — Compute-Memory Separation.** Small frozen Qwen3 (compute) +
   growing external memory (knowledge). Enables C2.
 - **Motivation only (not a deliverable) — Evaluation ∝ GDP / dynamic test-time
