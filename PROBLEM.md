@@ -57,20 +57,29 @@ Working title (pick at submission from results):
   **Anti-rot design (HARD CONSTRAINT — never "store everything"):** unbounded
   append causes quality rot (stale recalls), latency rot (slow top-k), and
   memory rot (RAM/disk blowup → breaks edge). Therefore from day one:
-  - **Salience-gated writes:** only write turns that pass a salience test
-    (new fact / preference / correction). Trivial turns ("ok", "thanks") are
-    forgotten immediately — like humans.
+  - **Relevance-gated writes (NOT surprise-gated):** store only turns containing
+    a *durable user fact/preference* (cheap entity/pattern check or a tiny
+    "memorable?" head). "hi wyd" → no fact → NOT stored even though it is
+    high-surprise. Surprise alone is rejected: it hits the "noisy-TV problem"
+    (unpredictable ≠ useful). Surprise may act as a secondary booster only.
   - **Bounded store:** hard cap N entries → bounds recall latency and RAM.
+    Benchmarked: 1000 entries = 4 MB, 0.17 ms recall on Mac MPS.
   - **Usefulness × recency eviction:** evict least-useful (old AND rarely
-    retrieved); keep frequently-recalled memories. Optional decay so memories
-    age out unless reinforced.
-  - **Consolidation (stretch):** periodically merge similar entries
-    (episodic → semantic summaries).
+    retrieved); keep frequently-recalled. Optional decay.
+  - **Consolidation (stretch):** merge similar entries (episodic → semantic).
 
-  This turns C2 from "we added a buffer" into a real research question:
-  **what should a speech assistant remember vs forget to stay relevant AND
-  real-time across sessions?** The rot problem IS the novelty. On-theme with the
-  manifesto: forgetting the trivial is a feature, not a bug.
+  **Latency is architecturally safe:** READ (recall while responding) is the
+  only memory op on the latency-critical path = 0.17 ms measured. WRITE / FORGET
+  / salience decisions happen AFTER the response is delivered, in background idle
+  time — the user waits 0 ms for them. So "memory without compromising latency"
+  is guaranteed by *where* the ops sit, not hoped for.
+
+  **Scope honesty:** optimal memory management is a whole research field; we do
+  NOT claim to solve it. The bounded claim: *a bounded native memory lets a small
+  speech LM personalize across sessions with recall off the critical path.*
+  Showing a robust fact-gating heuristic helps (vs no memory / vs store-all) IS
+  the contribution. If memory proves hard, the async-thinking paper (C1) stands
+  alone.
 - **Substrate — Compute-Memory Separation.** Small frozen Qwen3 (compute) +
   growing external memory (knowledge). Enables C2.
 - **Motivation only (not a deliverable) — Evaluation ∝ GDP / dynamic test-time
