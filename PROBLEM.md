@@ -1,216 +1,83 @@
-# Vanitas — Locked Problem Statement
+# Vanitas — Locked Research Spec
 
-> Decided 2026-06-01 after extended scoping. This is the research thesis the
-> project commits to. PLAN.md describes the engineering; this describes the
-> *why* and the *what's novel*.
+> Decided 2026-06-02 after extensive literature survey (~20 papers) and scoping.
+> This is the authoritative "what / why / what's ours" document.
+> PLAN.md holds the engineering steps; this holds the research thesis.
 
-## One-sentence contribution
+## One-line thesis
 
-**A real-time speech language model that thinks asynchronously — generating its
-response over *streaming* user input before the utterance completes, via an
-RL-trained commit/wait/revise policy — and continually learns its user at
-inference through external memory, with no backprop and no catastrophic
-forgetting.**
+**The first open, edge-deployable (<2B, on-device) speech model that reasons in
+latent space *while listening* to the user, and continually learns its user at
+inference through native memory — bringing two capabilities that today exist only
+as recent papers (no usable code) into a working, reproducible, small system.**
 
-Working title (pick at submission from results):
-- *"Learning to Think Before You Speak: Reinforcement-Learned Asynchronous
-  Generation for Streaming Speech Language Models"*
-- *"Vanitas: RL-Trained Asynchronous Thinking with Continual Memory for
-  Real-Time Speech"*
+## The honest framing
 
-### Contribution structure (locked)
+We are not claiming to *invent* latent reasoning or continual learning. We are
+the first to **implement them, openly and reproducibly, in a small on-device
+speech model** — a theory→practice contribution. Both target concepts are
+**paper-only with no public implementation** (verified 2026-06-02):
 
-- **Headline (C1) — Asynchronous Thinking.** Streaming speech generation that
-  starts responding before the user finishes, then revises as more audio
-  arrives. A new *capability* for speech LMs, directly cashing out the latency
-  goal (can reach ~zero / negative effective latency).
-- **Method for C1 — RL.** The core of async thinking is a sequential decision
-  under partial information: *commit / wait / revise*. Trained with RL (GRPO /
-  RLVR) on a verifiable reward = response quality − latency − revision cost.
-  This is *why RL is in the title* — it is the training method for the headline
-  capability, not a bolted-on extra.
-- **Contribution 2 (C2) — Continual learning at inference.** Memory-based,
-  non-parametric: the model writes experiences to an external memory and
-  retrieves at inference. No backprop, no catastrophic forgetting (weights
-  frozen). Under-explored for speech.
+- **Latent reasoning while listening** — FLAIR / "The Silent Thought"
+  (arXiv:2603.17837, Apr 2026): paper-only, no code released.
+- **Continual learning at inference for speech-to-speech** — theorized + done
+  for ASR/text (test-time training), but **never realized for S2S**.
 
-  **Concrete design (our own; inspired by, NOT copied from, Memorizing
-  Transformers, Wu et al. ICLR 2022, arXiv:2203.08913):**
-  - `VanitasKVMemory` module (~150 LOC we write): bounded tensors
-    `K_mem [N, n_kv_heads, head_dim]`, `V_mem [...]`.
-  - `write(k, v)`: `.detach()` + concat salient turn keys/values into the store;
-    evict oldest when full. **No backprop through writes** (matches pillar 4).
-  - `read(q)`: plain torch top-k cosine similarity (NOT Faiss/ANN — our store is
-    small enough; no external index, no service).
-  - Surgery hook: wrap ONE Qwen3 attention layer's forward to concatenate
-    retrieved memory K/V with local K/V before softmax — same style as the
-    validated Mamba surgery (wrap a layer, base frozen).
-  - Persistence: per-user store saved as a `.pt` file on device. No DB, no
-    Qdrant/Pinecone, **not RAG** (nothing stuffed into the text prompt; the model
-    attends to memory in latent KV space).
+"No one has implemented it yet" is the opportunity, not a problem.
 
-  **Why it's ours, not a copy:** (1) domain = speech tokens (unstudied);
-  (2) persistence = per-user-across-sessions, not per-document; (3) no external
-  ANN index; (4) memory feeds the async commit/wait/revise policy. Cite the
-  inspiration, claim the speech + continual + async instantiation.
+## NOT Moshi. NOT full-duplex.
 
-  **Anti-rot design (HARD CONSTRAINT — never "store everything"):** unbounded
-  append causes quality rot (stale recalls), latency rot (slow top-k), and
-  memory rot (RAM/disk blowup → breaks edge). Therefore from day one:
-  - **Relevance-gated writes (NOT surprise-gated):** store only turns containing
-    a *durable user fact/preference* (cheap entity/pattern check or a tiny
-    "memorable?" head). "hi wyd" → no fact → NOT stored even though it is
-    high-surprise. Surprise alone is rejected: it hits the "noisy-TV problem"
-    (unpredictable ≠ useful). Surprise may act as a secondary booster only.
-  - **Bounded store:** hard cap N entries → bounds recall latency and RAM.
-    Benchmarked: 1000 entries = 4 MB, 0.17 ms recall on Mac MPS.
-  - **Usefulness × recency eviction:** evict least-useful (old AND rarely
-    retrieved); keep frequently-recalled. Optional decay.
-  - **Consolidation (stretch):** merge similar entries (episodic → semantic).
+- **Base is Qwen3-1.7B + SLAM-Omni recipe**, NOT Moshi (7B, cloud — violates the
+  small/edge/cheap identity).
+- We do **listening-time reasoning** (the model thinks during the user's turn),
+  NOT Moshi-style talk-over-each-other full duplex (deferred / future work).
+- The "duplex feeling" (no awkward pause, thinks while you speak) comes from
+  streaming input + latent reasoning, achievable at edge scale.
 
-  **Latency is architecturally safe:** READ (recall while responding) is the
-  only memory op on the latency-critical path = 0.17 ms measured. WRITE / FORGET
-  / salience decisions happen AFTER the response is delivered, in background idle
-  time — the user waits 0 ms for them. So "memory without compromising latency"
-  is guaranteed by *where* the ops sit, not hoped for.
+## What we reuse (infrastructure — cited, frozen, not claimed)
 
-  **Scope honesty:** optimal memory management is a whole research field; we do
-  NOT claim to solve it. The bounded claim: *a bounded native memory lets a small
-  speech LM personalize across sessions with recall off the critical path.*
-  Showing a robust fact-gating heuristic helps (vs no memory / vs store-all) IS
-  the contribution. If memory proves hard, the async-thinking paper (C1) stands
-  alone.
-- **Substrate — Compute-Memory Separation.** Small frozen Qwen3 (compute) +
-  growing external memory (knowledge). Enables C2.
-- **Motivation only (not a deliverable) — Evaluation ∝ GDP / dynamic test-time
-  eval.** North-star framing; too broad to operationalize in this paper.
-
-Maps to the project's four-pillar vision: async thinking = pillar 2, continual
-learning = pillar 4, compute-memory separation = pillar 1, GDP-eval = pillar 3
-(motivation only).
-
-### Scope discipline
-
-- **Must-ship:** the RL-trained asynchronous-thinking streaming model on the
-  working SLAM-Omni + Qwen3 + Mamba base. This alone is the paper.
-- **C2 (memory continual learning):** cheap; add once C1 works.
-- Base build is identical regardless of headline → proceeds now, zero waste.
-
-## Why it's novel (pressure-tested against the literature)
-
-- Continual learning in speech exists **only for ASR and TTS speaker-adaptation**
-  (e.g. arXiv:2506.16574, arXiv:2103.14512). Nobody has studied continual
-  personalization of a full **speech-to-speech assistant**.
-- "First to study X" is the strongest claim a solo / low-budget researcher can
-  make. Problem-formulation + benchmark + baseline papers are disproportionately
-  cited and accepted because they open a direction rather than competing on
-  compute.
-
-## The reinforcing loop (why the pieces need each other)
-
-```
-        On-device (edge)  ──makes──►  personalization SAFE (privacy)
-              ▲                                  │
-              │                                  ▼
-   makes edge WORTH IT          personalization needs LOCAL data
-              │                                  │
-              └──────────  Vanitas  ◄────────────┘
-                   (latency / quality / intelligence
-                    are the constraints that make it usable)
-```
-
-- **Edge** makes personalization *safe* — you'd never let a cloud assistant deeply
-  learn your private life, but a fully-local one you would.
-- **Personalization** makes edge *worth it* — why run locally if the model is generic?
-- **Latency, quality, intelligence** are properties the system must *maintain*, not
-  separate contributions.
-
-## Two contributions
-
-1. **Continual on-device personalization for speech-to-speech** — the novel
-   problem (unstudied for S2S). *Headline.*
-2. **RL (GRPO/RLVR) for the latency–quality tradeoff** — keeps a personalizing
-   assistant fast + intelligible. Verifiable reward = ASR-intelligibility +
-   brevity. Trendy (post-R1 RLVR wave), and has a safe floor (always yields a
-   publishable Pareto curve).
-
-The **Mamba-hybrid backbone** is the engineering enabler (linear-time streaming →
-real-time on edge), not the headline — Jamba/Zamba already established
-Mamba-Transformer hybrids. **Edge + privacy** is the motivation + demo.
-
-Why RL is load-bearing, not bolted on: when the model personalizes (learns user
-facts), responses get longer/slower. RL with an intelligibility+brevity reward is
-the mechanism that keeps a personalizing assistant real-time. RL *serves* P1.
-
-## Scope discipline (committed vs stretch)
-
-| Phase | What | Commitment |
+| Component | Source | Role |
 |---|---|---|
-| **Must-ship (the paper)** | Working S2S base (SLAM-Omni recipe + Qwen3-1.7B + Mamba) + **P1 continual personalization + benchmark** + edge (GGUF) deployment | committed |
-| **Contribution 2 (primary stretch)** | **RL (GRPO/RLVR)** for latency–quality; pursue right after P1 works | strong intent |
-| Stretch (last) | **P2**: latent "think-before-speak" reasoning | only if P1 + RL land |
+| Qwen3-1.7B | Alibaba, Apache-2 | the brain (intelligence) |
+| SLAM-Omni recipe / SLAM-LLM | X-LANCE, MIT | S2S training scaffold (single-stage) |
+| Whisper encoder | OpenAI | ears (audio → features) |
+| SNAC / CosyVoice codec | MIT/Apache | mouth (tokens → waveform) |
 
-If only P1 ships, it is still a novel, publishable, A+-shot paper. RL and P2 are
-upgrades, never dependencies.
+## What we build ourselves (contributions — inspired, our own implementation)
 
-## The demo (the "abstract you can watch")
+| # | Contribution | Status | Risk |
+|---|---|---|---|
+| **C1 (headline)** | **Latent reasoning while listening** — recursive latent thinking during the user's speaking phase, FLAIR-inspired, our own implementation, at small/edge scale (no public code exists) | to build | 🔴 high (subtle method) |
+| **C2** | **Continual learning at inference** — native bounded KV memory; relevance-gated writes, no backprop, no catastrophic forgetting; first for S2S | module built ✅, integrate | 🟡 medium |
+| **Enabler** | **Mamba-hybrid Qwen3 backbone** — linear-time streaming; validated (PPL ratio 1.000) | done ✅ | 🟢 low |
+| **C3 (eval)** | **Custom benchmarks**: H1 interaction quality (timing/interruption/recovery), H2 genuine vs post-hoc reasoning under streaming, H4 reasoning quality under incomplete input | to design | 🟡 medium |
 
-Laptop in **airplane mode**. Three conversation sessions. By session 3 the
-assistant greets the user by name, recalls a preference stated in session 1,
-and has subtly matched the user's speaking pace — all offline, sub-300 ms,
-no network. The 90-second clip proves edge + privacy + personalization +
-latency + quality simultaneously.
+## Scope discipline (the safety net — do not violate)
 
-## Properties to maintain (hard constraints, measured in eval)
+- **Must-ship:** working base (SLAM-Omni + Qwen3 + Mamba) + **C2 (continual memory)** + at least one custom benchmark (C3). C2 is more robust to build than C1, so it anchors the paper.
+- **Headline stretch:** **C1 (latent reasoning while listening)** — the exciting, high-risk one. If it works → headline. If it fails → C2 + benchmarks still stand as a paper.
+- **Order:** base → C2 (memory, robust) → C3 (benchmarks) → C1 (latent reasoning, risky) last so a failure doesn't sink everything.
+- If C1 fails, the paper becomes "continual-learning S2S + benchmarks" — still novel, still publishable.
 
-- **Latency:** TTFA ≤ 300 ms on consumer hardware (target ≤ 200 ms on a 4090).
-- **Intelligence:** inherited from Qwen3-1.7B; must not regress after personalization.
-- **Speech quality:** UTMOS ≥ 3.2; generated speech intelligible (Whisper-WER ≤ 25%).
-- **No catastrophic forgetting:** general-task quality drops ≤ 2 pts after personalization.
-- **Edge:** INT4 GGUF, ≤ 8 GB, runs in llama.cpp on a Mac.
+## Honest venue read (no false hope)
 
-## Venue targets (honest)
-
-- Realistic A-tier: **Interspeech / ICASSP main**, **EMNLP/ACL Findings**.
-- Outside shot at A+: **EMNLP/ACL/NeurIPS main** if the forgetting analysis or
-  the personalization method is sharp/surprising.
-- No guarantees at any venue — acceptance is novelty × execution × reviewer luck.
-  P1's value is the high floor: a benchmark + framing is publishable even if the
-  method is simple.
+- Realistic A-tier: **Interspeech / ICASSP main, EMNLP/ACL Findings**.
+- The **custom benchmarks (C3)** are the realistic **A+ vehicle** — NeurIPS/ICLR
+  **Datasets & Benchmarks track** values exactly "the field lacks a benchmark for
+  X; here's one + baselines." The field explicitly says these benchmarks are missing.
+- A+ *main* track is a stretch (execution/scale bar is hard solo at $200) — possible
+  only if C1 lands with a surprising result. Don't bank morale on it.
+- No guarantees anywhere. The high floor: a working small system + a benchmark the
+  field wants = a real contribution regardless of venue.
 
 ## Budget
 
-~$150–180 (under the $200 ceiling). SFT base + personalization experiments are
-cheap (LoRA, simulated users). P2/P3 add cost only if pursued.
+~$120–180 (within $200). Base SFT ~$60–90; memory ~free; latent-reasoning training
+modest; benchmarks are eval (cheap). Cheap RL/latent smoke tests (~$2) de-risk
+before any big spend.
 
-## A+ reach angles — parked, decided LATER with evidence
+## The demo (abstract you can watch)
 
-Build the planned system first (P1 → P2 → P3). Once the base + personalization
-data exist, evaluate whether to chase one of these for a top-tier (NeurIPS/ACL
-main) push. We decide with measured evidence, not now.
-
-- ⭐ **Candidate A (NEW LEAD) — Predict-and-revise: responding before the user
-  finishes.** The model begins generating its spoken response from *partial*
-  user input and continuously revises as more audio streams in — so when the
-  user stops, the reply is already formed (sometimes *negative* latency). A new
-  *capability* (proactive, revisable speech generation), not engineered novelty.
-  Reframes latency from "respond fast after they finish" to "start before they
-  finish and be right." Honest stepping-stone to full-duplex without the full
-  cost. Hard ML problem (generate under uncertainty about utterance end +
-  revise) → genuine A+ depth. Unexplored for speech LMs.
-- **Candidate A2 (scientific, safer fallback) — does reasoning survive the
-  text→speech modality shift?** Measure whether a text LLM's reasoning degrades
-  when adapted to speak, why, and how to preserve it. Cheap (measurement), lower
-  risk, less flashy but A+ venues like clean scientific findings.
-- **Candidate A3 (retired as too toy) — RL-gated latent reasoning ("when to
-  think").** The "hi vs math problem" framing is engineered novelty, not
-  attention-worthy. Kept only as a possible *component* of predict-and-revise.
-- **Candidate B — RL-recovered quantization.** Aggressive INT4 flattens prosody
-  before content; use RL to recover expressive quality on the quantized edge
-  model. Ties size + RL. Studies quantization's differential effect on
-  acoustic vs semantic tokens.
-- **Candidate C — personalization without weight updates.** Memory-augmented
-  speech LM that personalizes by reading an external personal memory → zero
-  catastrophic forgetting by design (architectural, not a regularizer).
-
-Rejected as too generic: "what does a speech LM forget during personalization."
+Laptop, offline. The user starts a question; the model is *visibly reasoning in
+latent space while they speak* (a thinking indicator), answers with near-zero gap,
+and across sessions recalls user facts — all on-device, sub-300 ms, no cloud.
